@@ -1,7 +1,8 @@
-node_modules/
+node_modules
 .env
+nyrotrade-data.json
 *.log
-paper_trading.sqlite
-paper_trading.sqlite-shm
-paper_trading.sqlite-wal
 npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store
