@@ -16,6 +16,8 @@ const SentimentService = require('./services/sentiment');
 const RiskService = require('./services/risk');
 const PortfolioService = require('./services/portfolio');
 const AlertService = require('./services/alerts');
+const AnalyticsService = require('./services/analytics');
+const MarketRegimeService = require('./services/marketRegime');
 const TradingStrategy = require('./strategies/trading');
 const HealthService = require('./services/health');
 const TelegramService = require('./bot/telegram');
@@ -37,7 +39,7 @@ function validateRuntimeConfig() {
   }
 }
 
-async function warmup({ storage, blacklist, exchange, scanner, sentiment, portfolio, telegram, alerts, state }) {
+async function warmup({ storage, blacklist, exchange, scanner, sentiment, portfolio, telegram, alerts, marketRegime, analytics, state }) {
   logger.system('Starting NyroTrade warmup', { restartAt: config.lastRestartAt });
   await storage.ensureBootstrap();
   await blacklist.load();
@@ -50,6 +52,10 @@ async function warmup({ storage, blacklist, exchange, scanner, sentiment, portfo
   } catch (error) {
     logger.warn('Startup volatility scan failed; scheduler will retry', { error });
   }
+
+  await marketRegime.refresh().catch((error) => {
+    logger.warn('Startup market regime refresh failed; scheduler will retry', { error });
+  });
 
   const activeTickers = {};
   for (const symbol of await scanner.getWatchlist()) {
@@ -66,6 +72,9 @@ async function warmup({ storage, blacklist, exchange, scanner, sentiment, portfo
   }
 
   await portfolio.getSnapshot();
+  await analytics.refresh().catch((error) => {
+    logger.warn('Startup analytics refresh failed; scheduler will retry', { error });
+  });
   await telegram.configureWebhook();
   state.warmupComplete = true;
   logger.system('NyroTrade warmup complete');
@@ -93,6 +102,8 @@ async function start() {
   const risk = new RiskService({ storage, blacklist, config });
   const portfolio = new PortfolioService({ storage, cache, config, logger });
   const alerts = new AlertService({ storage, config, logger });
+  const marketRegime = new MarketRegimeService({ exchange, storage, config, logger });
+  const analytics = new AnalyticsService({ storage, portfolio, config, logger });
   const strategy = new TradingStrategy({
     analyzer,
     risk,
@@ -102,17 +113,20 @@ async function start() {
     storage,
     exchange,
     alerts,
+    marketRegime,
     config,
     logger
   });
-  const health = new HealthService({ storage, cache, sentiment, scanner, config, logger, state });
+  const health = new HealthService({ storage, cache, sentiment, scanner, analytics, marketRegime, config, logger, state });
 
   const services = {
     portfolio,
     scanner,
     health,
     storage,
-    strategy
+    strategy,
+    analytics,
+    marketRegime
   };
   const telegram = new TelegramService({ config, services, logger });
   alerts.setTelegram(telegram);
@@ -128,6 +142,8 @@ async function start() {
     portfolio,
     storage,
     cache,
+    analytics,
+    marketRegime,
     config,
     logger
   });
@@ -148,6 +164,8 @@ async function start() {
     portfolio,
     telegram,
     alerts,
+    marketRegime,
+    analytics,
     state
   });
 
@@ -178,7 +196,9 @@ async function start() {
       portfolio,
       strategy,
       health,
-      telegram
+      telegram,
+      analytics,
+      marketRegime
     }
   };
 }

@@ -5,6 +5,21 @@ const { chunkText, sleep } = require('../utils/format');
 const { withRetry } = require('../utils/retry');
 const { registerCommands } = require('../commands');
 
+const COMMAND_MENU = [
+  { command: 'start', description: 'Start NyroTrade and show available actions' },
+  { command: 'status', description: 'View bot mode, uptime, equity, and watchlist' },
+  { command: 'report', description: 'Get portfolio, exposure, cooldown, and market report' },
+  { command: 'stats', description: 'Review performance analytics and strategy health' },
+  { command: 'watchlist', description: 'Show the active monitored symbols' },
+  { command: 'topvolatile', description: 'Show current volatility rankings' },
+  { command: 'positions', description: 'List open paper positions and unrealized PnL' },
+  { command: 'trades', description: 'Show recent paper trade history' },
+  { command: 'health', description: 'Check webhook, Firestore, cache, and scheduler status' },
+  { command: 'pause', description: 'Pause new paper entries while monitoring continues' },
+  { command: 'resume', description: 'Resume strategy entries' },
+  { command: 'resetpaper', description: 'Reset virtual portfolio after confirmation' }
+];
+
 class TelegramService {
   constructor({ config, services, logger }) {
     this.config = config;
@@ -36,6 +51,8 @@ class TelegramService {
       return this.webhookStatus;
     }
 
+    await this.registerCommandMenu();
+
     const options = {
       allowed_updates: ['message']
     };
@@ -63,6 +80,21 @@ class TelegramService {
       url: this.config.telegram.fullWebhookUrl
     });
     return this.webhookStatus;
+  }
+
+  async registerCommandMenu() {
+    await withRetry(
+      () => this.bot.setMyCommands(COMMAND_MENU),
+      {
+        label: 'telegram.setMyCommands',
+        retries: 3,
+        timeoutMs: this.config.telegram.sendTimeoutMs,
+        logger: this.logger
+      }
+    );
+    this.logger.system('Telegram command menu registered', {
+      commands: COMMAND_MENU.map((item) => `/${item.command}`)
+    });
   }
 
   handleWebhook(req, res) {

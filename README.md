@@ -17,10 +17,13 @@ NyroTrade is paper trading only. It never submits real exchange trades.
 - `GET /health` endpoint for Render/Railway checks
 - Restart-safe scheduled jobs using Firestore locks
 - Self-ping for hosted free-tier uptime support
+- Telegram command menu registration with `setMyCommands`
+- ATR/EMA/higher-timeframe trend filters, confirmation candles, fake-breakout rejection, and market-regime-aware sizing
+- Performance analytics with win rate, expectancy, drawdown, streaks, symbol stats, and strategy health diagnostics
 
 ## Commands
 
-`/start`, `/status`, `/report`, `/watchlist`, `/scanvolatile`, `/topvolatile`, `/trades`, `/portfolio`, `/positions`, `/resetpaper`, `/pause`, `/resume`, `/health`
+`/start`, `/status`, `/report`, `/stats`, `/watchlist`, `/scanvolatile`, `/topvolatile`, `/trades`, `/portfolio`, `/positions`, `/resetpaper`, `/pause`, `/resume`, `/health`
 
 Use `/resetpaper confirm` to reset the virtual portfolio and paper trade history.
 
@@ -61,6 +64,8 @@ AUTO_DISCOVER_VOLATILE=true
 MAX_WATCHLIST_SIZE=15
 MIN_QUOTE_VOLUME_USDT=1000000
 VOLATILITY_SCAN_INTERVAL_MINUTES=15
+MIN_LIQUIDITY_SCORE=0.62
+HIGHER_TIMEFRAME=1h
 
 MAX_TRADE_FRACTION=0.10
 MAX_OPEN_POSITIONS=4
@@ -70,9 +75,20 @@ MIN_BUY_PRICE_CHANGE=0.002
 MIN_VOLUME_RATIO=1
 MAX_PUMP_ALREADY_MOVED=40
 ALERT_COOLDOWN_MINUTES=30
+GLOBAL_TRADE_COOLDOWN_MINUTES=5
+SYMBOL_TRADE_COOLDOWN_MINUTES=15
+CONFIRMATION_CANDLES=3
+MIN_BULLISH_CONFIRMATION_CANDLES=2
+REQUIRE_EMA_TREND=true
+REQUIRE_HIGHER_TIMEFRAME_TREND=true
+MAX_MEME_EXPOSURE_PCT=0.40
+TRAILING_STOP_PERCENT=0.035
 
 SELF_PING=true
 SELF_PING_MINUTES=5
+ANALYTICS_REFRESH_MINUTES=15
+REGIME_REFRESH_MINUTES=5
+AI_RANKING_ENABLED=false
 ```
 
 `WEBHOOK_URL` should be the public base URL only, for example `https://nyrotrade.onrender.com`. The app registers the Telegram endpoint at `/telegram/webhook`.
@@ -98,6 +114,28 @@ FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY----
 6. Do not commit the service account JSON file.
 
 Firestore collections are created automatically on first startup.
+
+## Migration Notes
+
+This update is backward-compatible with the existing Firestore collections. Existing `portfolio`, `positions`, `trades`, `watchlists`, `cooldowns`, `alerts`, `volatilityRankings`, `sentimentHistory`, and `lastKnownPrices` documents are preserved.
+
+New documents/collections are created automatically:
+
+- `analytics/performance` and `analyticsHistory/*`
+- `strategyDiagnostics/current`
+- `marketRegime/current`
+
+No manual migration is required. Add the new env vars only if you want to override the defaults.
+
+## Strategy Improvements
+
+NyroTrade now waits for stronger confirmation before paper entries: multiple bullish candles, sustained momentum, breakout confirmation, EMA20/EMA50 trend alignment, higher-timeframe momentum, spread checks, liquidity score, and abnormal one-candle pump rejection.
+
+Volatility scoring now blends ATR percentage, rolling standard deviation, candle range, daily movement, volume expansion, and spread penalty. Exits use confirmation candles, volatility-aware trailing stops, momentum decay, and less-sensitive stop-loss behavior to reduce premature sells.
+
+Portfolio sizing is confidence-, volatility-, ATR-, and market-regime-adjusted. Exposure controls cap meme and category concentration. The `/stats` command and scheduled analytics snapshots track long-term paper performance, including drawdown, expectancy, win rate, profit factor, streaks, symbol quality, and strategy health.
+
+AI sentiment/ranking support is prepared but disabled by default. If `AI_RANKING_ENABLED=true` and Ollama is configured, AI can assist filtering weak signals only. It never controls all trading decisions.
 
 ## Local Run
 

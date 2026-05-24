@@ -256,6 +256,83 @@ class SentimentService {
       headlines: []
     };
   }
+
+  async getAiSignalAssist({ symbol, metrics, sentiment }) {
+    const fallback = {
+      source: 'heuristic',
+      score: this.heuristicSignalScore(metrics, sentiment),
+      confidence: sentiment ? sentiment.confidence : 0.3,
+      reason: 'AI ranking disabled; heuristic filter only'
+    };
+
+    if (!this.config.sentiment.aiRankingEnabled || !this.config.sentiment.ollamaUrl) {
+      return fallback;
+    }
+
+    try {
+      const prompt = [
+        'You are assisting a crypto PAPER TRADING research filter.',
+        'You do not make trade decisions. Return only JSON: score 0..1, confidence 0..1, reason string.',
+        'Score the quality of this already-rule-filtered momentum setup.',
+        `Symbol: ${symbol}`,
+        `Sentiment: ${sentiment ? sentiment.label : 'neutral'} score ${sentiment ? sentiment.score : 0}`,
+        `Momentum: ${metrics.priceChange}`,
+        `Volume ratio: ${metrics.volumeRatio}`,
+        `Volatility score: ${metrics.volatilityScore}`,
+        `Breakout confirmed: ${metrics.breakoutConfirmed}`,
+        `EMA trend ok: ${metrics.emaTrendOk}`,
+        `Higher timeframe trend ok: ${metrics.higherTimeframeTrendOk}`
+      ].join('\n');
+
+      const response = await withRetry(
+        () => axios.post(`${this.config.sentiment.ollamaUrl}/api/generate`, {
+          model: this.config.sentiment.ollamaModel,
+          prompt,
+          stream: false,
+          options: { temperature: 0.1 }
+        }, {
+          timeout: this.config.sentiment.timeoutMs
+        }),
+        {
+          label: `ollama.signalAssist.${symbol}`,
+          retries: 1,
+          timeoutMs: this.config.sentiment.timeoutMs,
+          logger: this.logger
+        }
+      );
+
+      const raw = response.data && response.data.response ? response.data.response : '{}';
+      const match = raw.match(/\{[\s\S]*\}/);
+      const parsed = JSON.parse(match ? match[0] : raw);
+      return {
+        source: 'ollama-assist',
+        score: clamp(Number(parsed.score || fallback.score), 0, 1),
+        confidence: clamp(Number(parsed.confidence || fallback.confidence), 0, 1),
+        reason: String(parsed.reason || 'AI assist scored signal quality').slice(0, 240)
+      };
+    } catch (error) {
+      this.logger.warn('AI signal assist failed; using heuristic assist', { symbol, error });
+      return fallback;
+    }
+  }
+
+  heuristicSignalScore(metrics, sentiment) {
+    if (!metrics) return 0;
+    const sentimentScore = sentiment
+      ? (sentiment.label === 'bullish' ? 0.1 : sentiment.label === 'bearish' ? -0.2 : 0)
+      : 0;
+    return clamp(
+      metrics.momentumScore * 0.32
+        + metrics.volatilityScore * 0.22
+        + metrics.liquidityScore * 0.16
+        + (metrics.breakoutConfirmed ? 0.12 : 0)
+        + (metrics.emaTrendOk ? 0.08 : 0)
+        + (metrics.higherTimeframeTrendOk ? 0.06 : 0)
+        + sentimentScore,
+      0,
+      1
+    );
+  }
 }
 
 module.exports = SentimentService;

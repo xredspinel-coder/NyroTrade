@@ -17,11 +17,23 @@ class MarketAnalyzer {
       this.exchange.getOhlcv(symbol),
       market ? this.marketCap.getMarketCap(market.base) : Promise.resolve(null)
     ]);
+    const highTimeframeCandles = await this.exchange.getOhlcv(
+      symbol,
+      this.config.exchange.higherTimeframe,
+      this.config.exchange.higherTimeframeLimit
+    ).catch((error) => {
+      this.logger.warn('Higher timeframe candles unavailable; trend filter will be conservative', {
+        symbol,
+        error
+      });
+      return [];
+    });
 
     return analyzeMarket({
       symbol,
       ticker,
       candles,
+      highTimeframeCandles,
       market,
       marketCap: cap,
       config: this.config

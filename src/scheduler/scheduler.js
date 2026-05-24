@@ -19,6 +19,8 @@ class SchedulerService {
     portfolio,
     storage,
     cache,
+    analytics,
+    marketRegime,
     config,
     logger
   }) {
@@ -29,6 +31,8 @@ class SchedulerService {
     this.portfolio = portfolio;
     this.storage = storage;
     this.cache = cache;
+    this.analytics = analytics;
+    this.marketRegime = marketRegime;
     this.config = config;
     this.logger = logger;
     this.jobs = [];
@@ -47,6 +51,12 @@ class SchedulerService {
       const watchlist = await this.scanner.getWatchlist();
       await this.sentiment.refresh(watchlist);
     }, 25 * 60 * 1000);
+    this.addJob('market-regime-refresh', everyMinutes(this.config.scheduler.regimeRefreshMinutes), () => {
+      return this.marketRegime.refresh();
+    }, 4 * 60 * 1000);
+    this.addJob('analytics-refresh', everyMinutes(this.config.scheduler.analyticsRefreshMinutes), () => {
+      return this.analytics.refresh();
+    }, 10 * 60 * 1000);
     this.addJob('cache-cleanup', everyMinutes(this.config.cache.cleanupMinutes), async () => {
       this.cache.cleanup();
     }, 5 * 60 * 1000);

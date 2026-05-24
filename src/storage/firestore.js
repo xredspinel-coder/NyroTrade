@@ -17,6 +17,8 @@ class FirestoreStorage {
     this.config = config;
     this.logger = logger;
     this.instanceId = instanceId;
+    this.lastPriceCache = new Map();
+    this.lastWatchlistKey = null;
   }
 
   settingsRef() {
@@ -69,6 +71,18 @@ class FirestoreStorage {
 
   lastKnownPriceRef(symbol) {
     return this.db.collection('lastKnownPrices').doc(sanitizeId(symbol));
+  }
+
+  analyticsRef() {
+    return this.db.collection('analytics').doc('performance');
+  }
+
+  strategyDiagnosticsRef() {
+    return this.db.collection('strategyDiagnostics').doc('current');
+  }
+
+  marketRegimeRef() {
+    return this.db.collection('marketRegime').doc('current');
   }
 
   async ensureBootstrap() {
@@ -149,17 +163,23 @@ class FirestoreStorage {
 
   async getWatchlist() {
     const snap = await this.watchlistRef().get();
-    if (!snap.exists) return uniqueSymbols(this.config.scanner.initialWatchlist);
-    return uniqueSymbols(snap.data().symbols || []);
+    const symbols = snap.exists
+      ? uniqueSymbols(snap.data().symbols || [])
+      : uniqueSymbols(this.config.scanner.initialWatchlist);
+    this.lastWatchlistKey = symbols.join(',');
+    return symbols;
   }
 
   async saveWatchlist(symbols, source = 'scanner') {
     const normalized = uniqueSymbols(symbols).slice(0, this.config.scanner.maxWatchlistSize);
+    const key = normalized.join(',');
+    if (this.lastWatchlistKey === key) return normalized;
     await this.watchlistRef().set({
       symbols: normalized,
       source,
       updatedAt: nowDate()
     }, { merge: true });
+    this.lastWatchlistKey = key;
     return normalized;
   }
 
@@ -199,6 +219,16 @@ class FirestoreStorage {
       .sort((a, b) => toMillis(a.openedAt) - toMillis(b.openedAt));
   }
 
+  async getClosedPositions(limit = 250) {
+    const snap = await this.positionsCollection()
+      .where('status', '==', 'closed')
+      .limit(limit)
+      .get();
+    return snap.docs
+      .map((doc) => ({ id: doc.id, ...doc.data() }))
+      .sort((a, b) => toMillis(b.closedAt) - toMillis(a.closedAt));
+  }
+
   async getPosition(symbol) {
     const snap = await this.positionRef(symbol).get();
     return snap.exists ? { id: snap.id, ...snap.data() } : null;
@@ -210,6 +240,24 @@ class FirestoreStorage {
       .limit(limit)
       .get();
     return snap.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+  }
+
+  async getTrades(limit = 500) {
+    const snap = await this.tradesCollection()
+      .orderBy('executedAt', 'desc')
+      .limit(limit)
+      .get();
+    return snap.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+  }
+
+  async getActiveCooldowns(limit = 50) {
+    const snap = await this.db.collection('cooldowns')
+      .where('expiresAt', '>', nowDate())
+      .limit(limit)
+      .get();
+    return snap.docs
+      .map((doc) => ({ id: doc.id, ...doc.data() }))
+      .sort((a, b) => toMillis(a.expiresAt) - toMillis(b.expiresAt));
   }
 
   async saveAlert(alert) {
@@ -313,6 +361,48 @@ class FirestoreStorage {
     return snap.exists ? snap.data() : null;
   }
 
+  async saveAnalyticsSnapshot(analytics) {
+    const now = nowDate();
+    const historyRef = this.db.collection('analyticsHistory').doc();
+    const payload = {
+      ...analytics,
+      updatedAt: now
+    };
+    const batch = this.db.batch();
+    batch.set(this.analyticsRef(), payload, { merge: true });
+    batch.set(historyRef, payload);
+    await batch.commit();
+  }
+
+  async getLatestAnalytics() {
+    const snap = await this.analyticsRef().get();
+    return snap.exists ? snap.data() : null;
+  }
+
+  async saveStrategyDiagnostics(diagnostics) {
+    await this.strategyDiagnosticsRef().set({
+      ...diagnostics,
+      updatedAt: nowDate()
+    }, { merge: true });
+  }
+
+  async getStrategyDiagnostics() {
+    const snap = await this.strategyDiagnosticsRef().get();
+    return snap.exists ? snap.data() : null;
+  }
+
+  async saveMarketRegime(regime) {
+    await this.marketRegimeRef().set({
+      ...regime,
+      updatedAt: nowDate()
+    }, { merge: true });
+  }
+
+  async getMarketRegime() {
+    const snap = await this.marketRegimeRef().get();
+    return snap.exists ? snap.data() : null;
+  }
+
   async saveSentiment(symbol, result) {
     const now = nowDate();
     const cleanSymbol = String(symbol || 'MARKET').toUpperCase();
@@ -341,7 +431,19 @@ class FirestoreStorage {
 
   async updateLastKnownPrices(tickers) {
     const now = nowDate();
-    const entries = Object.entries(tickers || {}).filter(([, ticker]) => ticker && ticker.last);
+    const entries = Object.entries(tickers || {}).filter(([symbol, ticker]) => {
+      if (!ticker || !ticker.last) return false;
+      const last = this.lastPriceCache.get(symbol);
+      const price = Number(ticker.last);
+      const changed = !last || Math.abs(price - last.price) / Math.max(price, 1) >= 0.001;
+      const stale = !last || Date.now() - last.updatedAt >= this.config.storage.portfolioSnapshotMinSeconds * 1000;
+      if (changed || stale) {
+        this.lastPriceCache.set(symbol, { price, updatedAt: Date.now() });
+        return true;
+      }
+      return false;
+    });
+    if (entries.length === 0) return;
     await this.writeBatches(entries, (batch, [symbol, ticker]) => {
       batch.set(this.lastKnownPriceRef(symbol), {
         symbol,
@@ -373,6 +475,7 @@ class FirestoreStorage {
   async resetPaperPortfolio() {
     await this.deleteCollection(this.positionsCollection(), 250);
     await this.deleteCollection(this.tradesCollection(), 250);
+    await this.analyticsRef().delete().catch(() => undefined);
     await this.portfolioRef().set({
       cash: this.config.risk.paperStartBalance,
       startBalance: this.config.risk.paperStartBalance,
@@ -391,7 +494,8 @@ class FirestoreStorage {
       alerts: await this.deleteWhere(this.alertsCollection(), 'createdAt', '<=', addDays(now, -this.config.storage.staleAlertsDays)),
       sentiment: await this.deleteWhere(this.db.collection('sentimentHistory'), 'updatedAt', '<=', addDays(now, -this.config.storage.staleSentimentDays)),
       rankings: await this.deleteWhere(this.db.collection('volatilityRankings'), 'updatedAt', '<=', addDays(now, -this.config.storage.staleRankingsDays)),
-      prices: await this.deleteWhere(this.db.collection('lastKnownPrices'), 'updatedAt', '<=', addDays(now, -this.config.storage.stalePricesDays))
+      prices: await this.deleteWhere(this.db.collection('lastKnownPrices'), 'updatedAt', '<=', addDays(now, -this.config.storage.stalePricesDays)),
+      analyticsHistory: await this.deleteWhere(this.db.collection('analyticsHistory'), 'updatedAt', '<=', addDays(now, -30))
     };
     this.logger.info('Firestore stale data cleanup complete', results);
     return results;

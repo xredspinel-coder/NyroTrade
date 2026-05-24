@@ -79,6 +79,9 @@ class ScannerService {
 
       const ranked = analyzed
         .filter(Boolean)
+        .filter((item) => item.liquidityScore >= this.config.scanner.minLiquidityScore)
+        .filter((item) => !item.abnormalPump && !item.oneCandlePump)
+        .filter((item) => !item.fakeBreakoutRisk || item.momentumPersistence >= this.config.risk.minMomentumPersistence)
         .filter((item) => item.volatilityScore >= this.config.scanner.minVolatilityScore || item.momentumScore > 0.5)
         .sort((a, b) => b.rankScore - a.rankScore)
         .slice(0, limit);

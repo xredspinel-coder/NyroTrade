@@ -65,7 +65,9 @@ const config = {
     baseSymbol,
     requestTimeoutMs: 15000,
     ohlcvTimeframe: '5m',
-    ohlcvLimit: 48,
+    ohlcvLimit: 72,
+    higherTimeframe: process.env.HIGHER_TIMEFRAME || '1h',
+    higherTimeframeLimit: toInteger(process.env.HIGHER_TIMEFRAME_LIMIT, 72),
     marketReloadMinutes: 60
   },
 
@@ -80,7 +82,10 @@ const config = {
     minMarketCapUsd: toNumber(process.env.MIN_MARKET_CAP_USD, 0),
     candidateLimit: toInteger(process.env.SCANNER_CANDIDATE_LIMIT, 80),
     maxSpread: toNumber(process.env.MAX_SPREAD, 0.003),
-    minVolatilityScore: toNumber(process.env.MIN_VOLATILITY_SCORE, 0.45)
+    minVolatilityScore: toNumber(process.env.MIN_VOLATILITY_SCORE, 0.45),
+    minLiquidityScore: toNumber(process.env.MIN_LIQUIDITY_SCORE, 0.62),
+    abnormalPumpPercent: toNumber(process.env.ABNORMAL_PUMP_PERCENT, 18),
+    suspiciousSingleCandlePercent: toNumber(process.env.SUSPICIOUS_SINGLE_CANDLE_PERCENT, 9)
   },
 
   risk: {
@@ -96,7 +101,26 @@ const config = {
     paperFeeRate: toNumber(process.env.PAPER_FEE_RATE, 0.001),
     minTradeNotional: toNumber(process.env.MIN_TRADE_NOTIONAL, 5),
     buyCooldownMinutes: toInteger(process.env.BUY_COOLDOWN_MINUTES, 20),
-    sellVolatilityRankThreshold: toNumber(process.env.SELL_VOLATILITY_RANK_THRESHOLD, 0.25)
+    globalTradeCooldownMinutes: toInteger(process.env.GLOBAL_TRADE_COOLDOWN_MINUTES, 5),
+    symbolTradeCooldownMinutes: toInteger(process.env.SYMBOL_TRADE_COOLDOWN_MINUTES, 15),
+    sellVolatilityRankThreshold: toNumber(process.env.SELL_VOLATILITY_RANK_THRESHOLD, 0.25),
+    confirmationCandles: toInteger(process.env.CONFIRMATION_CANDLES, 3),
+    minBullishConfirmationCandles: toInteger(process.env.MIN_BULLISH_CONFIRMATION_CANDLES, 2),
+    minMomentumPersistence: toNumber(process.env.MIN_MOMENTUM_PERSISTENCE, 0.67),
+    minBreakoutPercent: toNumber(process.env.MIN_BREAKOUT_PERCENT, 0.0015),
+    emaFastPeriod: toInteger(process.env.EMA_FAST_PERIOD, 20),
+    emaSlowPeriod: toInteger(process.env.EMA_SLOW_PERIOD, 50),
+    requireEmaTrend: toBoolean(process.env.REQUIRE_EMA_TREND, true),
+    requireHigherTimeframeTrend: toBoolean(process.env.REQUIRE_HIGHER_TIMEFRAME_TREND, true),
+    maxMemeExposurePct: toNumber(process.env.MAX_MEME_EXPOSURE_PCT, 0.40),
+    maxCategoryExposurePct: toNumber(process.env.MAX_CATEGORY_EXPOSURE_PCT, 0.60),
+    trailingStopPercent: toNumber(process.env.TRAILING_STOP_PERCENT, 0.035),
+    trailingStopActivationPct: toNumber(process.env.TRAILING_STOP_ACTIVATION_PCT, 0.035),
+    exitConfirmationCandles: toInteger(process.env.EXIT_CONFIRMATION_CANDLES, 2),
+    volatilityExitAtrMultiplier: toNumber(process.env.VOLATILITY_EXIT_ATR_MULTIPLIER, 1.8),
+    maxExtremeVolatilityScore: toNumber(process.env.MAX_EXTREME_VOLATILITY_SCORE, 0.98),
+    staleSignalMaxAgeMinutes: toInteger(process.env.STALE_SIGNAL_MAX_AGE_MINUTES, 3),
+    minStrategyHealthScore: toNumber(process.env.MIN_STRATEGY_HEALTH_SCORE, 0.25)
   },
 
   cache: {
@@ -109,6 +133,8 @@ const config = {
   scheduler: {
     strategyIntervalMinutes: toInteger(process.env.STRATEGY_INTERVAL_MINUTES, 1),
     sentimentRefreshMinutes: toInteger(process.env.SENTIMENT_REFRESH_MINUTES, 30),
+    analyticsRefreshMinutes: toInteger(process.env.ANALYTICS_REFRESH_MINUTES, 15),
+    regimeRefreshMinutes: toInteger(process.env.REGIME_REFRESH_MINUTES, 5),
     selfPing: toBoolean(process.env.SELF_PING, true),
     selfPingMinutes: toInteger(process.env.SELF_PING_MINUTES, 5)
   },
@@ -117,6 +143,8 @@ const config = {
     ollamaUrl: normalizeBaseUrl(process.env.OLLAMA_URL),
     ollamaModel: process.env.OLLAMA_MODEL || 'llama3.1',
     timeoutMs: toInteger(process.env.SENTIMENT_TIMEOUT_MS, 15000),
+    aiRankingEnabled: toBoolean(process.env.AI_RANKING_ENABLED, false),
+    minSentimentConfidence: toNumber(process.env.MIN_SENTIMENT_CONFIDENCE, 0.25),
     sources: [
       'https://www.coindesk.com/arc/outboundfeeds/rss/',
       'https://cointelegraph.com/rss',
@@ -128,7 +156,8 @@ const config = {
     staleAlertsDays: toInteger(process.env.STALE_ALERTS_DAYS, 14),
     staleSentimentDays: toInteger(process.env.STALE_SENTIMENT_DAYS, 14),
     staleRankingsDays: toInteger(process.env.STALE_RANKINGS_DAYS, 7),
-    stalePricesDays: toInteger(process.env.STALE_PRICES_DAYS, 7)
+    stalePricesDays: toInteger(process.env.STALE_PRICES_DAYS, 7),
+    portfolioSnapshotMinSeconds: toInteger(process.env.PORTFOLIO_SNAPSHOT_MIN_SECONDS, 60)
   }
 };
 

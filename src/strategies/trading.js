@@ -10,6 +10,7 @@ class TradingStrategy {
     storage,
     exchange,
     alerts,
+    marketRegime,
     config,
     logger
   }) {
@@ -21,6 +22,7 @@ class TradingStrategy {
     this.storage = storage;
     this.exchange = exchange;
     this.alerts = alerts;
+    this.marketRegime = marketRegime;
     this.config = config;
     this.logger = logger;
     this.running = false;
@@ -58,6 +60,10 @@ class TradingStrategy {
           sentiment: symbolSentiment
         });
 
+        if (decision.positionPatch && this.hasPositionPatchChanged(position, decision.positionPatch)) {
+          await this.portfolio.updatePositionRiskState(position.symbol, decision.positionPatch);
+        }
+
         if (!decision.shouldSell) continue;
 
         const result = await this.portfolio.closePosition({
@@ -93,6 +99,11 @@ class TradingStrategy {
     const watchlist = await this.scanner.getWatchlist();
     const openPositions = await this.storage.getOpenPositions();
     const openBySymbol = new Map(openPositions.map((position) => [position.symbol, position]));
+    const [snapshot, marketRegime, diagnostics] = await Promise.all([
+      this.portfolio.getSnapshot(),
+      this.marketRegime.getCurrent().catch(() => null),
+      this.storage.getStrategyDiagnostics().catch(() => null)
+    ]);
     const signals = [];
 
     await this.exchange.getTickers(watchlist);
@@ -110,10 +121,27 @@ class TradingStrategy {
           sentiment: symbolSentiment,
           openPositions,
           existingPosition,
-          settings
+          settings,
+          snapshot,
+          marketRegime,
+          diagnostics
         });
 
         if (!decision.allowed) {
+          continue;
+        }
+
+        const aiAssist = await this.sentiment.getAiSignalAssist({
+          symbol,
+          metrics,
+          sentiment: symbolSentiment
+        });
+        if (this.config.sentiment.aiRankingEnabled && aiAssist.score < 0.35) {
+          this.logger.signal('Signal rejected by optional AI assist filter', {
+            symbol,
+            score: aiAssist.score,
+            reason: aiAssist.reason
+          });
           continue;
         }
 
@@ -121,7 +149,8 @@ class TradingStrategy {
           'positive momentum',
           'volume spike confirmed',
           'high volatility score',
-          `${symbolSentiment.label} sentiment`
+          `${symbolSentiment.label} sentiment`,
+          `assist ${Math.round(aiAssist.score * 100)}%`
         ].join(', ');
 
         const result = await this.portfolio.openPosition({
@@ -129,7 +158,8 @@ class TradingStrategy {
           metrics,
           sentiment: symbolSentiment,
           confidence: decision.confidence,
-          reason
+          reason,
+          marketRegime
         });
 
         if (!result.executed) {
@@ -140,6 +170,7 @@ class TradingStrategy {
           continue;
         }
 
+        openPositions.push(result.position);
         signals.push({ symbol, metrics, confidence: decision.confidence, reason });
         await this.alerts.sendSignalAlert({
           symbol,
@@ -166,6 +197,15 @@ class TradingStrategy {
     }
 
     return signals;
+  }
+
+  hasPositionPatchChanged(position, patch) {
+    return Object.entries(patch).some(([key, value]) => {
+      const current = Number(position[key] || 0);
+      const next = Number(value || 0);
+      if (!Number.isFinite(current) || !Number.isFinite(next)) return position[key] !== value;
+      return Math.abs(current - next) / Math.max(Math.abs(next), 1) > 0.0005;
+    });
   }
 }
 

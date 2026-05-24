@@ -10,7 +10,7 @@ function timestamp(value) {
 function formatTopVolatile(items) {
   if (!items || items.length === 0) return 'No volatility rankings yet.';
   return items.map((item, index) => {
-    return `${index + 1}. ${item.symbol} | score ${round(item.rankScore, 3)} | vol ${round(item.volatilityScore, 3)} | momentum ${percent(item.priceChange)} | volume ${round(item.volumeRatio, 2)}x`;
+    return `${index + 1}. ${item.symbol} | score ${round(item.rankScore, 3)} | ATR ${percent(item.atrPercent || 0)} | momentum ${percent(item.priceChange)} | volume ${round(item.volumeRatio, 2)}x`;
   }).join('\n');
 }
 
@@ -22,13 +22,23 @@ function formatTrades(trades, baseSymbol) {
   }).join('\n');
 }
 
+function formatCooldowns(cooldowns) {
+  if (!cooldowns || cooldowns.length === 0) return 'No active cooldowns.';
+  return cooldowns.slice(0, 8).map((cooldown) => {
+    const expiresAt = timestamp(cooldown.expiresAt);
+    return `${cooldown.key || cooldown.id} until ${expiresAt}`;
+  }).join('\n');
+}
+
 function registerCommands({ bot, telegram, services, config, logger }) {
   const {
     portfolio,
     scanner,
     health,
     storage,
-    strategy
+    strategy,
+    analytics,
+    marketRegime
   } = services;
 
   bot.on('message', async (msg) => {
@@ -51,7 +61,7 @@ function registerCommands({ bot, telegram, services, config, logger }) {
             'NyroTrade is online.',
             'Paper trading only. It monitors volatile spot markets, scores momentum and sentiment, and tracks a virtual portfolio.',
             '',
-            'Commands: /status /portfolio /positions /watchlist /scanvolatile /topvolatile /trades /report /pause /resume /health'
+            'Commands: /status /report /stats /portfolio /positions /watchlist /topvolatile /trades /pause /resume /resetpaper /health'
           ].join('\n'), { chatId });
           break;
 
@@ -73,20 +83,39 @@ function registerCommands({ bot, telegram, services, config, logger }) {
         }
 
         case '/report': {
-          const [snapshot, top, trades] = await Promise.all([
+          const [snapshot, top, trades, cooldowns, diagnostics, regime, stats] = await Promise.all([
             portfolio.getSnapshot(),
             scanner.getTopVolatile(5),
-            portfolio.getRecentTrades(5)
+            portfolio.getRecentTrades(5),
+            storage.getActiveCooldowns(12),
+            storage.getStrategyDiagnostics(),
+            marketRegime.getCurrent(),
+            analytics.getLatestOrCompute()
           ]);
           await telegram.sendMessage([
+            'NyroTrade research report',
+            `Market regime: ${regime.regime} | aggressiveness ${percent(regime.aggressiveness)}`,
+            `Strategy health: ${percent((diagnostics && diagnostics.strategyHealthScore) || 0)}`,
+            `Recent win rate: ${percent((stats && stats.recentWinRate) || 0)}`,
+            '',
             portfolio.formatSnapshot(snapshot),
+            `Exposure: meme ${percent((snapshot.exposurePct && snapshot.exposurePct.meme) || 0)} | volatile ${percent((snapshot.exposurePct && snapshot.exposurePct.volatile) || 0)} | core ${percent((snapshot.exposurePct && snapshot.exposurePct.core) || 0)}`,
             '',
             'Top volatile',
             formatTopVolatile(top),
             '',
+            'Active cooldowns',
+            formatCooldowns(cooldowns),
+            '',
             'Recent trades',
             formatTrades(trades, config.exchange.baseSymbol)
           ].join('\n'), { chatId });
+          break;
+        }
+
+        case '/stats': {
+          const stats = await analytics.refresh();
+          await telegram.sendMessage(analytics.formatStats(stats), { chatId });
           break;
         }
 
@@ -162,13 +191,15 @@ function registerCommands({ bot, telegram, services, config, logger }) {
             `Market update: ${status.latestMarketUpdate || 'n/a'}`,
             `Sentiment update: ${status.latestSentimentUpdate || 'n/a'}`,
             `Open positions: ${status.openPositionsCount}`,
+            `Strategy health: ${status.strategyHealthScore === null ? 'n/a' : percent(status.strategyHealthScore)}`,
+            `Market regime: ${status.marketRegime || 'n/a'}`,
             `Cache: ${JSON.stringify(status.cacheSize)}`
           ].join('\n'), { chatId });
           break;
         }
 
         default:
-          await telegram.sendMessage('Unknown command. Try /status, /portfolio, /watchlist, /scanvolatile, /topvolatile, /trades, /pause, /resume, or /health.', { chatId });
+          await telegram.sendMessage('Unknown command. Try /status, /report, /stats, /portfolio, /watchlist, /topvolatile, /trades, /pause, /resume, or /health.', { chatId });
       }
     } catch (error) {
       logger.error('Telegram command failed', { command, error });
