@@ -50,24 +50,40 @@ function ema(values, period) {
 
 function trueRanges(candles) {
   const ranges = [];
+  let lastClose = 0;
   for (let index = 0; index < candles.length; index += 1) {
     const candle = candles[index];
     const high = candleHigh(candle);
     const low = candleLow(candle);
-    const previousClose = index > 0 ? candleClose(candles[index - 1]) : candleClose(candle);
-    if (!high || !low) continue;
+    const candleCloseValue = candleClose(candle);
+    const previousClose = index > 0 ? (lastClose || candleClose(candles[index - 1])) : candleCloseValue;
+    if (!(high > 0) || !(low > 0)) continue;
     ranges.push(Math.max(
       high - low,
       Math.abs(high - previousClose),
       Math.abs(low - previousClose)
     ));
+    if (candleCloseValue > 0) lastClose = candleCloseValue;
   }
   return ranges;
 }
 
 function atr(candles, period = 14) {
   const ranges = trueRanges(candles).slice(-period);
-  return average(ranges);
+  const value = average(ranges);
+  if (value > 0) return value;
+  // Fallback: if TR computation yields 0 due to sparse/malformed candles,
+  // approximate ATR from average high-low ranges.
+  const usable = (candles || []).filter((candle) => Array.isArray(candle) && candle.length >= 6);
+  const window = usable.slice(-period);
+  const hl = window
+    .map((candle) => {
+      const h = candleHigh(candle);
+      const l = candleLow(candle);
+      return h > 0 && l > 0 ? (h - l) : null;
+    })
+    .filter((v) => v !== null);
+  return average(hl);
 }
 
 function countBullishConfirmation(candles, count) {
@@ -164,7 +180,10 @@ function analyzeMarket({ symbol, ticker, candles, highTimeframeCandles, market, 
   const recentVolume = average(recentWindow.map(candleVolume));
   const priorVolume = average(priorWindow.map(candleVolume));
   const tickerVolume = safeNumber(ticker && (ticker.quoteVolume || ticker.baseVolume));
-  const volumeRatio = priorVolume > 0 ? recentVolume / priorVolume : (recentVolume > 0 ? 2 : 0);
+  const volumeDataOk = priorWindow.length >= 4 && recentWindow.length >= 3;
+  const volumeRatio = !volumeDataOk
+    ? 1
+    : (priorVolume > 0 ? recentVolume / priorVolume : (recentVolume > 0 ? 1.05 : 1));
 
   const closes = usableCandles.map(candleClose).filter((value) => value > 0);
   const returns = closes.slice(1).map((close, index) => {
@@ -178,8 +197,6 @@ function analyzeMarket({ symbol, ticker, candles, highTimeframeCandles, market, 
   const high = Math.max(...highs, lastPrice);
   const low = Math.min(...lows, lastPrice);
   const range = lastPrice > 0 && Number.isFinite(high) && Number.isFinite(low) ? (high - low) / lastPrice : 0;
-  const atrValue = atr(usableCandles, 14);
-  const atrPercent = lastPrice > 0 ? atrValue / lastPrice : 0;
   const candleRanges = usableCandles.map((candle) => {
     const highValue = candleHigh(candle);
     const lowValue = candleLow(candle);
@@ -187,6 +204,9 @@ function analyzeMarket({ symbol, ticker, candles, highTimeframeCandles, market, 
     return closeValue > 0 ? (highValue - lowValue) / closeValue : 0;
   }).filter((value) => Number.isFinite(value));
   const averageCandleRange = average(candleRanges.slice(-24));
+  const atrValue = atr(usableCandles, 14);
+  const rawAtrPercent = lastPrice > 0 ? atrValue / lastPrice : 0;
+  const atrPercent = rawAtrPercent > 0 ? rawAtrPercent : (averageCandleRange > 0 ? averageCandleRange * 0.85 : 0.0015);
 
   const bid = safeNumber(ticker && ticker.bid);
   const ask = safeNumber(ticker && ticker.ask);
@@ -235,10 +255,10 @@ function analyzeMarket({ symbol, ticker, candles, highTimeframeCandles, market, 
   );
 
   const momentumScore = clamp(
-    (priceChange * 5)
-      + (recentMomentum * 7)
-      + (acceleration * 4)
-      + clamp((volumeRatio - 1) / 3, 0, 0.4),
+    clamp(priceChange * 3, 0, 0.35) * 0.3
+      + clamp(recentMomentum * 4, 0, 0.35) * 0.35
+      + clamp(acceleration * 2, -0.15, 0.25) * 0.15
+      + clamp((volumeRatio - 1) / 2, 0, 0.3) * 0.2,
     0,
     1
   );
@@ -270,6 +290,7 @@ function analyzeMarket({ symbol, ticker, candles, highTimeframeCandles, market, 
     recentMomentum,
     acceleration,
     volumeRatio,
+    volumeDataOk,
     volatility,
     rollingStddev,
     atr: atrValue,

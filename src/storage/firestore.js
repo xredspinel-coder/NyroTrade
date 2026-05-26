@@ -19,14 +19,22 @@ class FirestoreStorage {
     this.instanceId = instanceId;
     this.lastPriceCache = new Map();
     this.lastWatchlistKey = null;
+    this.cooldownCache = new Map();
   }
 
   settingsRef() {
     return this.db.collection('settings').doc('main');
   }
 
-  portfolioRef() {
-    return this.db.collection('portfolio').doc('paper');
+  portfolioRef(strategyKey) {
+    if (!strategyKey || strategyKey === 'legacy') {
+      return this.db.collection('portfolio').doc('paper');
+    }
+    return this.db.collection('strategyPortfolios').doc(String(strategyKey));
+  }
+
+  strategySettingsRef(strategyKey) {
+    return this.db.collection('strategySettings').doc(String(strategyKey));
   }
 
   watchlistRef() {
@@ -41,8 +49,11 @@ class FirestoreStorage {
     return this.db.collection('positions');
   }
 
-  positionRef(symbol) {
-    return this.positionsCollection().doc(sanitizeId(symbol));
+  positionRef(symbol, strategyKey) {
+    if (!strategyKey || strategyKey === 'legacy') {
+      return this.positionsCollection().doc(sanitizeId(symbol));
+    }
+    return this.positionsCollection().doc(sanitizeId(`${strategyKey}__${symbol}`));
   }
 
   tradesCollection() {
@@ -75,6 +86,10 @@ class FirestoreStorage {
 
   analyticsRef() {
     return this.db.collection('analytics').doc('performance');
+  }
+
+  strategyAnalyticsRef(strategyKey) {
+    return this.db.collection('strategyAnalytics').doc(String(strategyKey));
   }
 
   strategyDiagnosticsRef() {
@@ -132,6 +147,50 @@ class FirestoreStorage {
       });
     }
 
+    await batch.commit();
+
+    await this.ensureStrategyBootstrap(now).catch((error) => {
+      this.logger.warn('Strategy bootstrap skipped or failed', { error });
+    });
+  }
+
+  async ensureStrategyBootstrap(now = nowDate()) {
+    const strategyKeys = ['wavehunter', 'momentumpulse', 'whaleshadow', 'sentinelmind'];
+    const startBalance = Number(this.config.risk.paperStartBalance || 100);
+    const perStrategy = startBalance / strategyKeys.length;
+
+    const refs = strategyKeys.flatMap((key) => [this.portfolioRef(key), this.strategySettingsRef(key)]);
+    const snaps = await Promise.all(refs.map((ref) => ref.get()));
+    const batch = this.db.batch();
+    for (let i = 0; i < strategyKeys.length; i += 1) {
+      const key = strategyKeys[i];
+      const portfolioSnap = snaps[i * 2];
+      const settingsSnap = snaps[i * 2 + 1];
+
+      if (!portfolioSnap.exists) {
+        batch.set(this.portfolioRef(key), {
+          strategyKey: key,
+          cash: perStrategy,
+          startBalance: perStrategy,
+          baseSymbol: this.config.exchange.baseSymbol,
+          realizedPnl: 0,
+          equity: perStrategy,
+          createdAt: now,
+          updatedAt: now
+        });
+      }
+
+      if (!settingsSnap.exists) {
+        batch.set(this.strategySettingsRef(key), {
+          strategyKey: key,
+          paused: false,
+          aggressiveness: 0.55,
+          maxOpenPositions: Math.max(1, Math.floor(Number(this.config.risk.maxOpenPositions || 4) / 2)),
+          createdAt: now,
+          updatedAt: now
+        });
+      }
+    }
     await batch.commit();
   }
 
@@ -198,56 +257,64 @@ class FirestoreStorage {
     return normalized;
   }
 
-  async getPortfolio() {
-    const snap = await this.portfolioRef().get();
+  async getPortfolio(strategyKey) {
+    const snap = await this.portfolioRef(strategyKey).get();
     return snap.exists ? snap.data() : null;
   }
 
-  async savePortfolio(patch) {
-    await this.portfolioRef().set({
+  async savePortfolio(patch, strategyKey) {
+    await this.portfolioRef(strategyKey).set({
       ...patch,
       updatedAt: nowDate()
     }, { merge: true });
   }
 
-  async getOpenPositions() {
+  async getOpenPositions(strategyKey) {
     const snap = await this.positionsCollection()
       .where('status', '==', 'open')
       .get();
-    return snap.docs
+    const rows = snap.docs
       .map((doc) => ({ id: doc.id, ...doc.data() }))
       .sort((a, b) => toMillis(a.openedAt) - toMillis(b.openedAt));
+    if (!strategyKey) return rows;
+    return rows.filter((row) => String(row.strategyKey || 'legacy') === String(strategyKey));
   }
 
-  async getClosedPositions(limit = 250) {
+  async getClosedPositions(limit = 250, strategyKey) {
     const snap = await this.positionsCollection()
       .where('status', '==', 'closed')
       .limit(limit)
       .get();
-    return snap.docs
+    const rows = snap.docs
       .map((doc) => ({ id: doc.id, ...doc.data() }))
       .sort((a, b) => toMillis(b.closedAt) - toMillis(a.closedAt));
+    if (!strategyKey) return rows;
+    return rows.filter((row) => String(row.strategyKey || 'legacy') === String(strategyKey));
   }
 
-  async getPosition(symbol) {
-    const snap = await this.positionRef(symbol).get();
+  async getPosition(symbol, strategyKey) {
+    const snap = await this.positionRef(symbol, strategyKey).get();
     return snap.exists ? { id: snap.id, ...snap.data() } : null;
   }
 
-  async getRecentTrades(limit = 10) {
+  async getRecentTrades(limit = 10, strategyKey) {
     const snap = await this.tradesCollection()
       .orderBy('executedAt', 'desc')
       .limit(limit)
       .get();
-    return snap.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+    const rows = snap.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+    if (!strategyKey) return rows;
+    return rows.filter((row) => String(row.strategyKey || 'legacy') === String(strategyKey));
   }
 
-  async getTrades(limit = 500) {
+  async getTrades(limit = 500, strategyKey) {
     const snap = await this.tradesCollection()
       .orderBy('executedAt', 'desc')
       .limit(limit)
       .get();
-    return snap.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+    const rows = snap.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+    if (!strategyKey) return rows;
+    return rows.filter((row) => String(row.strategyKey || 'legacy') === String(strategyKey));
   }
 
   async getActiveCooldowns(limit = 50) {
@@ -269,8 +336,24 @@ class FirestoreStorage {
     return ref.id;
   }
 
+  async isCooldownActive(key) {
+    const cached = this.cooldownCache.get(key);
+    if (cached && cached.expiresAt > Date.now()) return true;
+    if (cached && cached.expiresAt <= Date.now()) this.cooldownCache.delete(key);
+
+    const snap = await this.cooldownRef(key).get();
+    if (!snap.exists) return false;
+    const expiresAt = toMillis(snap.data().expiresAt);
+    const active = expiresAt > Date.now();
+    if (active) {
+      this.cooldownCache.set(key, { expiresAt });
+    }
+    return active;
+  }
+
   async setCooldown(key, ttlMs, meta = {}) {
     const expiresAt = new Date(Date.now() + ttlMs);
+    this.cooldownCache.set(key, { expiresAt: expiresAt.getTime() });
     await this.cooldownRef(key).set({
       key,
       expiresAt,
@@ -280,14 +363,8 @@ class FirestoreStorage {
     return expiresAt;
   }
 
-  async isCooldownActive(key) {
-    const snap = await this.cooldownRef(key).get();
-    if (!snap.exists) return false;
-    const expiresAt = toMillis(snap.data().expiresAt);
-    return expiresAt > Date.now();
-  }
-
   async clearCooldown(key) {
+    this.cooldownCache.delete(key);
     await this.cooldownRef(key).delete();
   }
 
@@ -372,6 +449,25 @@ class FirestoreStorage {
     batch.set(this.analyticsRef(), payload, { merge: true });
     batch.set(historyRef, payload);
     await batch.commit();
+  }
+
+  async saveStrategyAnalyticsSnapshot(strategyKey, analytics) {
+    const now = nowDate();
+    const historyRef = this.db.collection('strategyAnalyticsHistory').doc();
+    const payload = {
+      ...analytics,
+      strategyKey,
+      updatedAt: now
+    };
+    const batch = this.db.batch();
+    batch.set(this.strategyAnalyticsRef(strategyKey), payload, { merge: true });
+    batch.set(historyRef, payload);
+    await batch.commit();
+  }
+
+  async getLatestStrategyAnalytics(strategyKey) {
+    const snap = await this.strategyAnalyticsRef(strategyKey).get();
+    return snap.exists ? snap.data() : null;
   }
 
   async getLatestAnalytics() {

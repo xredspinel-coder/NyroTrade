@@ -1,6 +1,7 @@
 'use strict';
 
 const { money, percent, round } = require('../utils/format');
+const { getStrategyRisk, regimeMultiplier } = require('../strategies/strategyConfig');
 
 class PortfolioService {
   constructor({ storage, cache, config, logger }) {
@@ -30,10 +31,10 @@ class PortfolioService {
     }
   }
 
-  async getSnapshot() {
+  async getSnapshot({ strategyKey } = {}) {
     const [portfolio, positions] = await Promise.all([
-      this.storage.getPortfolio(),
-      this.storage.getOpenPositions()
+      this.storage.getPortfolio(strategyKey),
+      this.storage.getOpenPositions(strategyKey)
     ]);
 
     let positionValue = 0;
@@ -69,7 +70,7 @@ class PortfolioService {
     }
 
     const base = portfolio || {
-      cash: this.config.risk.paperStartBalance,
+      cash: strategyKey ? (this.config.risk.paperStartBalance / 4) : this.config.risk.paperStartBalance,
       realizedPnl: 0,
       baseSymbol: this.config.exchange.baseSymbol
     };
@@ -87,7 +88,7 @@ class PortfolioService {
         unrealizedPnl,
         exposure,
         exposurePct
-      });
+      }, strategyKey);
       this.lastPortfolioWriteAt = Date.now();
       this.lastPortfolioEquity = equity;
     }
@@ -120,24 +121,27 @@ class PortfolioService {
     return 'other';
   }
 
-  calculateAllocation({ cash, equity, metrics, confidence, marketRegime }) {
-    const maxFraction = this.config.risk.maxTradeFraction;
+  calculateAllocation({ strategyKey, cash, equity, metrics, confidence, marketRegime }) {
+    const strategyRisk = getStrategyRisk(strategyKey, this.config.risk);
+    const maxFraction = strategyRisk.maxTradeFraction || this.config.risk.maxTradeFraction;
     const volatilityMultiplier = 1 - Math.min(0.55, Number(metrics.volatilityScore || 0) * 0.35);
     const confidenceMultiplier = 0.45 + Math.min(0.65, Number(confidence || 0));
-    const regimeMultiplier = marketRegime ? Number(marketRegime.aggressiveness || 0.55) : 0.55;
-    const atrPenalty = 1 - Math.min(0.45, Number(metrics.atrPercent || 0) / 0.08);
+    const regimeMult = regimeMultiplier(marketRegime, strategyRisk);
+    const atrPct = Math.max(Number(metrics.atrPercent || 0), 0.0015);
+    const atrPenalty = 1 - Math.min(0.45, atrPct / 0.08);
     const fraction = Math.max(
       0.02,
-      Math.min(maxFraction, maxFraction * volatilityMultiplier * confidenceMultiplier * regimeMultiplier * atrPenalty)
+      Math.min(maxFraction, maxFraction * volatilityMultiplier * confidenceMultiplier * regimeMult * atrPenalty)
     );
     return Math.min(cash, Math.max(this.config.risk.minTradeNotional, equity * fraction));
   }
 
-  async openPosition({ symbol, metrics, sentiment, confidence, reason, marketRegime }) {
-    return this.withLocalLock(`open:${symbol}`, async () => {
+  async openPosition({ strategyKey, symbol, metrics, sentiment, confidence, reason, marketRegime }) {
+    const lockKey = `open:${strategyKey || 'legacy'}:${symbol}`;
+    return this.withLocalLock(lockKey, async () => {
       const result = await this.storage.db.runTransaction(async (transaction) => {
-        const portfolioRef = this.storage.portfolioRef();
-        const positionRef = this.storage.positionRef(symbol);
+        const portfolioRef = this.storage.portfolioRef(strategyKey);
+        const positionRef = this.storage.positionRef(symbol, strategyKey);
         const [portfolioSnap, positionSnap, openSnap] = await Promise.all([
           transaction.get(portfolioRef),
           transaction.get(positionRef),
@@ -145,22 +149,28 @@ class PortfolioService {
         ]);
 
         const portfolio = portfolioSnap.exists ? portfolioSnap.data() : {
-          cash: this.config.risk.paperStartBalance,
+          cash: strategyKey ? (this.config.risk.paperStartBalance / 4) : this.config.risk.paperStartBalance,
           realizedPnl: 0,
-          equity: this.config.risk.paperStartBalance,
+          equity: strategyKey ? (this.config.risk.paperStartBalance / 4) : this.config.risk.paperStartBalance,
           baseSymbol: this.config.exchange.baseSymbol
         };
 
         if (positionSnap.exists && positionSnap.data().status === 'open') {
           return { executed: false, reason: 'duplicate open position' };
         }
-        if (openSnap.size >= this.config.risk.maxOpenPositions) {
+        const strategyRisk = getStrategyRisk(strategyKey, this.config.risk);
+        const openCount = strategyKey
+          ? openSnap.docs.filter((doc) => String((doc.data() || {}).strategyKey || 'legacy') === String(strategyKey)).length
+          : openSnap.size;
+        const maxPositions = strategyRisk.maxOpenPositions || this.config.risk.maxOpenPositions;
+        if (openCount >= maxPositions) {
           return { executed: false, reason: 'max open positions reached' };
         }
 
         const cash = Number(portfolio.cash || 0);
         const equity = Number(portfolio.equity || portfolio.cash || this.config.risk.paperStartBalance);
         const notional = this.calculateAllocation({
+          strategyKey,
           cash,
           equity,
           metrics,
@@ -180,6 +190,7 @@ class PortfolioService {
         const category = this.getCategory(symbol, metrics);
         const position = {
           symbol,
+          strategyKey: strategyKey || 'legacy',
           status: 'open',
           category,
           quantity,
@@ -193,7 +204,7 @@ class PortfolioService {
           confidence,
           sentiment: sentiment ? sentiment.label : 'neutral',
           reason,
-          strategy: 'momentum-volume-volatility-confirmed',
+          strategy: strategyKey || 'momentum-volume-volatility-confirmed',
           marketRegime: marketRegime ? marketRegime.regime : 'unknown',
           metrics,
           openedAt: now,
@@ -219,6 +230,7 @@ class PortfolioService {
           confidence,
           reason,
           sentiment: sentiment ? sentiment.label : 'neutral',
+          strategyKey: strategyKey || 'legacy',
           executedAt: now
         });
 
@@ -226,16 +238,20 @@ class PortfolioService {
       });
 
       if (result.executed) {
-        const cooldownMs = this.config.risk.globalTradeCooldownMinutes * 60 * 1000;
-        const symbolCooldownMs = this.config.risk.symbolTradeCooldownMinutes * 60 * 1000;
-        await this.storage.setCooldown('global:trade', cooldownMs, { type: 'global-trade' });
-        await this.storage.setCooldown(`trade:${symbol}`, symbolCooldownMs, { symbol, type: 'symbol-trade' });
+        const strategyRisk = getStrategyRisk(strategyKey, this.config.risk);
+        const cooldownMs = (strategyRisk.globalTradeCooldownMinutes || this.config.risk.globalTradeCooldownMinutes) * 60 * 1000;
+        const symbolCooldownMs = (strategyRisk.symbolTradeCooldownMinutes || this.config.risk.symbolTradeCooldownMinutes) * 60 * 1000;
+        const buyCooldownMs = (strategyRisk.buyCooldownMinutes || this.config.risk.buyCooldownMinutes) * 60 * 1000;
+        const prefix = strategyKey ? `${strategyKey}:` : '';
+        await this.storage.setCooldown(`${prefix}global:trade`, cooldownMs, { type: 'global-trade', strategyKey: strategyKey || 'legacy' });
+        await this.storage.setCooldown(`${prefix}trade:${symbol}`, symbolCooldownMs, { symbol, type: 'symbol-trade', strategyKey: strategyKey || 'legacy' });
         await this.storage.setCooldown(
-          `buy:${symbol}`,
-          this.config.risk.buyCooldownMinutes * 60 * 1000,
-          { symbol, type: 'buy' }
+          `${prefix}buy:${symbol}`,
+          buyCooldownMs,
+          { symbol, type: 'buy', strategyKey: strategyKey || 'legacy' }
         );
         this.logger.trade('Opened paper position', {
+          strategyKey: strategyKey || 'legacy',
           symbol,
           price: metrics.price,
           notional: result.position.notional,
@@ -248,11 +264,12 @@ class PortfolioService {
     });
   }
 
-  async closePosition({ symbol, price, metrics, sentiment, reason }) {
-    return this.withLocalLock(`close:${symbol}`, async () => {
+  async closePosition({ strategyKey, symbol, price, metrics, sentiment, reason }) {
+    const lockKey = `close:${strategyKey || 'legacy'}:${symbol}`;
+    return this.withLocalLock(lockKey, async () => {
       const result = await this.storage.db.runTransaction(async (transaction) => {
-        const portfolioRef = this.storage.portfolioRef();
-        const positionRef = this.storage.positionRef(symbol);
+        const portfolioRef = this.storage.portfolioRef(strategyKey);
+        const positionRef = this.storage.positionRef(symbol, strategyKey);
         const [portfolioSnap, positionSnap] = await Promise.all([
           transaction.get(portfolioRef),
           transaction.get(positionRef)
@@ -263,9 +280,9 @@ class PortfolioService {
         }
 
         const portfolio = portfolioSnap.exists ? portfolioSnap.data() : {
-          cash: this.config.risk.paperStartBalance,
+          cash: strategyKey ? (this.config.risk.paperStartBalance / 4) : this.config.risk.paperStartBalance,
           realizedPnl: 0,
-          equity: this.config.risk.paperStartBalance,
+          equity: strategyKey ? (this.config.risk.paperStartBalance / 4) : this.config.risk.paperStartBalance,
           baseSymbol: this.config.exchange.baseSymbol
         };
         const position = positionSnap.data();
@@ -313,6 +330,7 @@ class PortfolioService {
           pnlPct,
           reason,
           sentiment: sentiment ? sentiment.label : 'neutral',
+          strategyKey: strategyKey || 'legacy',
           executedAt: now
         });
 
@@ -329,16 +347,20 @@ class PortfolioService {
       });
 
       if (result.executed) {
-        const cooldownMs = this.config.risk.globalTradeCooldownMinutes * 60 * 1000;
-        const symbolCooldownMs = this.config.risk.symbolTradeCooldownMinutes * 60 * 1000;
-        await this.storage.setCooldown('global:trade', cooldownMs, { type: 'global-trade' });
-        await this.storage.setCooldown(`trade:${symbol}`, symbolCooldownMs, { symbol, type: 'symbol-trade' });
+        const strategyRisk = getStrategyRisk(strategyKey, this.config.risk);
+        const cooldownMs = (strategyRisk.globalTradeCooldownMinutes || this.config.risk.globalTradeCooldownMinutes) * 60 * 1000;
+        const symbolCooldownMs = (strategyRisk.symbolTradeCooldownMinutes || this.config.risk.symbolTradeCooldownMinutes) * 60 * 1000;
+        const buyCooldownMs = (strategyRisk.buyCooldownMinutes || this.config.risk.buyCooldownMinutes) * 60 * 1000;
+        const prefix = strategyKey ? `${strategyKey}:` : '';
+        await this.storage.setCooldown(`${prefix}global:trade`, cooldownMs, { type: 'global-trade', strategyKey: strategyKey || 'legacy' });
+        await this.storage.setCooldown(`${prefix}trade:${symbol}`, symbolCooldownMs, { symbol, type: 'symbol-trade', strategyKey: strategyKey || 'legacy' });
         await this.storage.setCooldown(
-          `buy:${symbol}`,
-          this.config.risk.buyCooldownMinutes * 60 * 1000,
-          { symbol, type: 'post-sell' }
+          `${prefix}buy:${symbol}`,
+          buyCooldownMs,
+          { symbol, type: 'post-sell', strategyKey: strategyKey || 'legacy' }
         );
         this.logger.trade('Closed paper position', {
+          strategyKey: strategyKey || 'legacy',
           symbol,
           price,
           reason,
@@ -351,9 +373,9 @@ class PortfolioService {
     });
   }
 
-  async updatePositionRiskState(symbol, patch) {
+  async updatePositionRiskState(symbol, patch, strategyKey) {
     if (!patch || Object.keys(patch).length === 0) return;
-    await this.storage.positionRef(symbol).set({
+    await this.storage.positionRef(symbol, strategyKey).set({
       ...patch,
       updatedAt: new Date()
     }, { merge: true });

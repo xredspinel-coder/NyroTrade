@@ -18,6 +18,7 @@ const PortfolioService = require('./services/portfolio');
 const AlertService = require('./services/alerts');
 const AnalyticsService = require('./services/analytics');
 const MarketRegimeService = require('./services/marketRegime');
+const WhaleIntelService = require('./services/whaleIntel');
 const TradingStrategy = require('./strategies/trading');
 const HealthService = require('./services/health');
 const TelegramService = require('./bot/telegram');
@@ -103,6 +104,7 @@ async function start() {
   const portfolio = new PortfolioService({ storage, cache, config, logger });
   const alerts = new AlertService({ storage, config, logger });
   const marketRegime = new MarketRegimeService({ exchange, storage, config, logger });
+  const whaleIntel = new WhaleIntelService({ config, logger });
   const analytics = new AnalyticsService({ storage, portfolio, config, logger });
   const strategy = new TradingStrategy({
     analyzer,
@@ -114,6 +116,7 @@ async function start() {
     exchange,
     alerts,
     marketRegime,
+    whaleIntel,
     config,
     logger
   });

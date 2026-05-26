@@ -24,7 +24,7 @@ class AnalyticsService {
   }
 
   async refresh() {
-    const analytics = await this.compute();
+    const analytics = await this.computeAll();
     await this.storage.saveAnalyticsSnapshot(analytics);
     await this.storage.saveStrategyDiagnostics(analytics.strategyDiagnostics);
     this.logger.info('Analytics snapshot refreshed', {
@@ -41,11 +41,43 @@ class AnalyticsService {
     return this.refresh();
   }
 
-  async compute() {
+  async computeAll() {
+    const strategyKeys = ['wavehunter', 'momentumpulse', 'whaleshadow', 'sentinelmind'];
+    const [overall, byStrategy, regime] = await Promise.all([
+      this.compute(),
+      Promise.all(strategyKeys.map(async (strategyKey) => {
+        const computed = await this.compute({ strategyKey });
+        await this.storage.saveStrategyAnalyticsSnapshot(strategyKey, computed).catch(() => undefined);
+        return computed;
+      })),
+      this.storage.getMarketRegime().catch(() => null)
+    ]);
+
+    const comparison = byStrategy.map((row) => ({
+      strategyKey: row.strategyKey,
+      winRate: row.winRate,
+      profitFactor: row.profitFactor,
+      expectancy: row.expectancy,
+      maxDrawdown: row.maxDrawdown,
+      totalRealizedPnl: row.totalRealizedPnl
+    }));
+
+    return {
+      ...overall,
+      marketRegime: regime ? regime.regime : 'unknown',
+      strategies: comparison,
+      byStrategy: byStrategy.reduce((acc, row) => {
+        acc[row.strategyKey] = row;
+        return acc;
+      }, {})
+    };
+  }
+
+  async compute({ strategyKey } = {}) {
     const [trades, closedPositions, snapshot, regime] = await Promise.all([
-      this.storage.getTrades(500),
-      this.storage.getClosedPositions(250),
-      this.portfolio.getSnapshot(),
+      this.storage.getTrades(500, strategyKey),
+      this.storage.getClosedPositions(250, strategyKey),
+      this.portfolio.getSnapshot(strategyKey ? { strategyKey } : undefined),
       this.storage.getMarketRegime().catch(() => null)
     ]);
 
@@ -66,7 +98,7 @@ class AnalyticsService {
     const sharpeLikeRatio = stddev(returns) > 0 ? mean(returns) / stddev(returns) : 0;
 
     const sortedSells = sells.slice().sort((a, b) => toMillis(a.executedAt) - toMillis(b.executedAt));
-    let equity = this.config.risk.paperStartBalance;
+    let equity = strategyKey ? (this.config.risk.paperStartBalance / 4) : this.config.risk.paperStartBalance;
     let peak = equity;
     let maxDrawdown = 0;
     for (const trade of sortedSells) {
@@ -114,6 +146,7 @@ class AnalyticsService {
     );
 
     return {
+      strategyKey: strategyKey || 'legacy',
       totalTrades: trades.length,
       totalBuys: buys.length,
       totalSells: sells.length,
@@ -186,8 +219,15 @@ class AnalyticsService {
   formatStats(analytics) {
     const base = this.config.exchange.baseSymbol;
     const streak = analytics.currentStreak || { type: 'none', count: 0 };
+    const startBalance = analytics.strategyKey && analytics.strategyKey !== 'legacy'
+      ? this.config.risk.paperStartBalance / 4
+      : this.config.risk.paperStartBalance;
+    const pnlPct = startBalance > 0 ? (Number(analytics.totalRealizedPnl || 0) / startBalance) : 0;
+    const label = analytics.strategyKey && analytics.strategyKey !== 'legacy'
+      ? `${analytics.strategyKey} performance`
+      : 'NyroTrade performance stats';
     return [
-      'NyroTrade performance stats',
+      label,
       `Trades: ${analytics.totalTrades} (${analytics.totalBuys} buys / ${analytics.totalSells} sells)`,
       `Win rate: ${percent(analytics.winRate)} | Loss rate: ${percent(analytics.lossRate)}`,
       `Average profit: ${money(analytics.averageProfit, base)}`,
@@ -201,12 +241,28 @@ class AnalyticsService {
       `Best symbol: ${analytics.bestSymbol ? `${analytics.bestSymbol.symbol} ${money(analytics.bestSymbol.pnl, base)}` : 'n/a'}`,
       `Worst symbol: ${analytics.worstSymbol ? `${analytics.worstSymbol.symbol} ${money(analytics.worstSymbol.pnl, base)}` : 'n/a'}`,
       `Average hold: ${round((analytics.averageHoldSeconds || 0) / 3600, 2)}h`,
-      `Realized PnL: ${money(analytics.totalRealizedPnl, base)}`,
+      `Realized PnL: ${money(analytics.totalRealizedPnl, base)} (${percent(pnlPct)})`,
       `Unrealized PnL: ${money(analytics.unrealizedPnl || 0, base)}`,
       `Sharpe-like ratio: ${round(analytics.sharpeLikeRatio, 3)}`,
       `Trade frequency: ${round(analytics.tradeFrequencyPerDay, 2)}/day`,
       `Strategy health: ${percent((analytics.strategyDiagnostics || {}).strategyHealthScore || 0)}`
     ].join('\n');
+  }
+
+  formatStrategyComparison(analytics, baseSymbol) {
+    const rows = (analytics && analytics.strategies) || [];
+    if (!rows.length) return 'No strategy stats yet.';
+    const perStrategy = startBalance => (row) => {
+      const pnlPct = startBalance > 0 ? (Number(row.totalRealizedPnl || 0) / startBalance) : 0;
+      return `${row.strategyKey}: ${percent(pnlPct)} | win ${percent(row.winRate || 0)} | PF ${round(row.profitFactor || 0, 2)} | DD ${percent(row.maxDrawdown || 0)}`;
+    };
+    const start = this.config.risk.paperStartBalance / 4;
+    return rows.map((row) => {
+      const name = row.strategyKey;
+      const pnl = money(row.totalRealizedPnl || 0, baseSymbol);
+      const pnlPct = start > 0 ? percent((Number(row.totalRealizedPnl || 0) / start)) : '0%';
+      return `${name}: ${pnl} (${pnlPct}) | win ${percent(row.winRate || 0)} | PF ${round(row.profitFactor || 0, 2)} | DD ${percent(row.maxDrawdown || 0)}`;
+    }).join('\n');
   }
 }
 

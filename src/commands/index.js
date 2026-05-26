@@ -1,6 +1,7 @@
 'use strict';
 
 const { duration, money, percent, round, toMillis } = require('../utils/format');
+const { STRATEGIES } = require('../strategies/registry');
 
 function timestamp(value) {
   const ms = toMillis(value);
@@ -18,7 +19,8 @@ function formatTrades(trades, baseSymbol) {
   if (!trades || trades.length === 0) return 'No paper trades yet.';
   return trades.map((trade) => {
     const pnl = trade.pnl !== undefined ? ` | PnL ${money(trade.pnl, baseSymbol)} (${percent(trade.pnlPct || 0)})` : '';
-    return `${trade.side} ${trade.symbol} @ ${round(trade.price, 8)} | ${money(trade.notional, baseSymbol)}${pnl} | ${timestamp(trade.executedAt)}`;
+    const label = trade.strategyKey && trade.strategyKey !== 'legacy' ? ` [${trade.strategyKey}]` : '';
+    return `${trade.side}${label} ${trade.symbol} @ ${round(trade.price, 8)} | ${money(trade.notional, baseSymbol)}${pnl} | ${timestamp(trade.executedAt)}`;
   }).join('\n');
 }
 
@@ -27,6 +29,20 @@ function formatCooldowns(cooldowns) {
   return cooldowns.slice(0, 8).map((cooldown) => {
     const expiresAt = timestamp(cooldown.expiresAt);
     return `${cooldown.key || cooldown.id} until ${expiresAt}`;
+  }).join('\n');
+}
+
+function formatStrategyComparison(analytics, baseSymbol) {
+  const rows = (analytics && analytics.strategies) || [];
+  if (!rows.length) return 'No strategy stats yet.';
+  const nameByKey = STRATEGIES.reduce((acc, s) => {
+    acc[s.key] = s.name;
+    return acc;
+  }, {});
+  return rows.map((row) => {
+    const name = nameByKey[row.strategyKey] || row.strategyKey;
+    const pnl = money(row.totalRealizedPnl || 0, baseSymbol);
+    return `${name}: ${pnl} | win ${percent(row.winRate || 0)} | PF ${round(row.profitFactor || 0, 2)} | DD ${percent(row.maxDrawdown || 0)}`;
   }).join('\n');
 }
 
@@ -59,24 +75,24 @@ function registerCommands({ bot, telegram, services, config, logger }) {
         case '/start':
           await telegram.sendMessage([
             'NyroTrade is online.',
-            'Paper trading only. It monitors volatile spot markets, scores momentum and sentiment, and tracks a virtual portfolio.',
+            'Paper trading only. Multi-strategy research platform: WaveHunter, MomentumPulse, WhaleShadow, SentinelMind.',
             '',
-            'Commands: /status /report /stats /portfolio /positions /watchlist /topvolatile /trades /pause /resume /resetpaper /health'
+            'Commands: /status /report /stats /strategies /wave /whales /sentiment /positions /watchlist /topvolatile /trades /pause /resume /resetpaper /health'
           ].join('\n'), { chatId });
           break;
 
         case '/status': {
           const [settings, snapshot, watchlist] = await Promise.all([
             storage.getSettings(),
-            portfolio.getSnapshot(),
+            portfolio.getSnapshot({ strategyKey: 'momentumpulse' }).catch(() => portfolio.getSnapshot()),
             scanner.getWatchlist()
           ]);
           await telegram.sendMessage([
             'NyroTrade status',
             `Mode: ${settings.paused ? 'paused' : 'active'}`,
             `Uptime: ${duration(process.uptime())}`,
-            `Equity: ${money(snapshot.equity, config.exchange.baseSymbol)}`,
-            `Open positions: ${snapshot.positions.length}/${config.risk.maxOpenPositions}`,
+            `MomentumPulse equity: ${money(snapshot.equity, config.exchange.baseSymbol)}`,
+            `MomentumPulse open: ${snapshot.positions.length}/${config.risk.maxOpenPositions}`,
             `Watchlist: ${watchlist.join(', ')}`
           ].join('\n'), { chatId });
           break;
@@ -84,7 +100,7 @@ function registerCommands({ bot, telegram, services, config, logger }) {
 
         case '/report': {
           const [snapshot, top, trades, cooldowns, diagnostics, regime, stats] = await Promise.all([
-            portfolio.getSnapshot(),
+            portfolio.getSnapshot({ strategyKey: 'momentumpulse' }).catch(() => portfolio.getSnapshot()),
             scanner.getTopVolatile(5),
             portfolio.getRecentTrades(5),
             storage.getActiveCooldowns(12),
@@ -97,6 +113,9 @@ function registerCommands({ bot, telegram, services, config, logger }) {
             `Market regime: ${regime.regime} | aggressiveness ${percent(regime.aggressiveness)}`,
             `Strategy health: ${percent((diagnostics && diagnostics.strategyHealthScore) || 0)}`,
             `Recent win rate: ${percent((stats && stats.recentWinRate) || 0)}`,
+            '',
+            'Strategy comparison',
+            formatStrategyComparison(stats, config.exchange.baseSymbol),
             '',
             portfolio.formatSnapshot(snapshot),
             `Exposure: meme ${percent((snapshot.exposurePct && snapshot.exposurePct.meme) || 0)} | volatile ${percent((snapshot.exposurePct && snapshot.exposurePct.volatile) || 0)} | core ${percent((snapshot.exposurePct && snapshot.exposurePct.core) || 0)}`,
@@ -116,6 +135,40 @@ function registerCommands({ bot, telegram, services, config, logger }) {
         case '/stats': {
           const stats = await analytics.refresh();
           await telegram.sendMessage(analytics.formatStats(stats), { chatId });
+          break;
+        }
+
+        case '/strategies': {
+          const stats = await analytics.getLatestOrCompute();
+          await telegram.sendMessage([
+            'NyroTrade strategies',
+            formatStrategyComparison(stats, config.exchange.baseSymbol)
+          ].join('\n'), { chatId });
+          break;
+        }
+
+        case '/wave': {
+          const stats = await storage.getLatestStrategyAnalytics('wavehunter').catch(() => null);
+          await telegram.sendMessage(stats ? analytics.formatStats(stats) : 'WaveHunter stats not ready yet. Wait for /stats to run.', { chatId });
+          break;
+        }
+
+        case '/whales': {
+          const stats = await storage.getLatestStrategyAnalytics('whaleshadow').catch(() => null);
+          await telegram.sendMessage(stats ? analytics.formatStats(stats) : 'WhaleShadow stats not ready yet. Wait for /stats to run.', { chatId });
+          break;
+        }
+
+        case '/sentiment': {
+          const stats = await storage.getLatestStrategyAnalytics('sentinelmind').catch(() => null);
+          const market = await storage.getLatestSentiment('MARKET').catch(() => null);
+          await telegram.sendMessage([
+            stats ? analytics.formatStats(stats) : 'SentinelMind stats not ready yet. Wait for /stats to run.',
+            '',
+            market
+              ? `Market sentiment: ${market.label} score ${round(market.score, 2)} conf ${percent(market.confidence || 0)}`
+              : 'Market sentiment: n/a'
+          ].join('\n'), { chatId });
           break;
         }
 
@@ -145,18 +198,31 @@ function registerCommands({ bot, telegram, services, config, logger }) {
         }
 
         case '/portfolio': {
-          const snapshot = await portfolio.getSnapshot();
-          await telegram.sendMessage(portfolio.formatSnapshot(snapshot), { chatId });
+          const snapshot = await portfolio.getSnapshot({ strategyKey: 'momentumpulse' }).catch(() => portfolio.getSnapshot());
+          await telegram.sendMessage(`MomentumPulse portfolio\n${portfolio.formatSnapshot(snapshot)}`, { chatId });
           break;
         }
 
         case '/positions': {
-          const snapshot = await portfolio.getSnapshot();
-          if (snapshot.positions.length === 0) {
-            await telegram.sendMessage('No open paper positions.', { chatId });
-          } else {
-            await telegram.sendMessage(portfolio.formatSnapshot(snapshot), { chatId });
+          const snapshots = await Promise.all([
+            portfolio.getSnapshot({ strategyKey: 'wavehunter' }),
+            portfolio.getSnapshot({ strategyKey: 'momentumpulse' }),
+            portfolio.getSnapshot({ strategyKey: 'whaleshadow' }),
+            portfolio.getSnapshot({ strategyKey: 'sentinelmind' })
+          ]).catch(() => []);
+
+          if (!snapshots.length) {
+            const fallback = await portfolio.getSnapshot();
+            await telegram.sendMessage(fallback.positions.length ? portfolio.formatSnapshot(fallback) : 'No open paper positions.', { chatId });
+            break;
           }
+
+          const texts = [];
+          const keys = ['WaveHunter', 'MomentumPulse', 'WhaleShadow', 'SentinelMind'];
+          snapshots.forEach((snap, idx) => {
+            texts.push(`${keys[idx]} (${snap.positions.length} open)\n${portfolio.formatSnapshot(snap)}`);
+          });
+          await telegram.sendMessage(texts.join('\n\n'), { chatId });
           break;
         }
 
