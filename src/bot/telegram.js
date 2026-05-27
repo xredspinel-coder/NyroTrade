@@ -9,6 +9,7 @@ const COMMAND_MENU = [
   { command: 'start', description: 'Start NyroTrade and show available actions' },
   { command: 'status', description: 'View bot mode, uptime, equity, and watchlist' },
   { command: 'report', description: 'Get portfolio, exposure, cooldown, and market report' },
+  { command: 'control', description: 'Open inline control panel for reports, strategies, and paper trading' },
   { command: 'stats', description: 'Review performance analytics and strategy health' },
   { command: 'strategies', description: 'Compare strategy PnL, win rate, drawdown' },
   { command: 'wave', description: 'WaveHunter details and stats' },
@@ -58,7 +59,7 @@ class TelegramService {
     await this.registerCommandMenu();
 
     const options = {
-      allowed_updates: ['message']
+      allowed_updates: ['message', 'callback_query']
     };
     if (this.config.telegram.webhookSecret) {
       options.secret_token = this.config.telegram.webhookSecret;
@@ -135,11 +136,18 @@ class TelegramService {
 
   async sendChunks(chatId, text, options) {
     const chunks = chunkText(text, this.config.telegram.maxMessageLength);
-    for (const chunk of chunks) {
+    const { chatId: _chatId, ...telegramOptions } = options || {};
+    for (let index = 0; index < chunks.length; index += 1) {
+      const chunk = chunks[index];
+      const extra = {
+        disable_web_page_preview: true,
+        ...telegramOptions
+      };
+      if (chunks.length > 1 && index < chunks.length - 1) {
+        delete extra.reply_markup;
+      }
       await withRetry(
-        () => this.bot.sendMessage(chatId, chunk, {
-          disable_web_page_preview: true
-        }),
+        () => this.bot.sendMessage(chatId, chunk, extra),
         {
           label: 'telegram.sendMessage',
           retries: 3,

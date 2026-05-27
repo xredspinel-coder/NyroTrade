@@ -177,13 +177,19 @@ function analyzeMarket({ symbol, ticker, candles, highTimeframeCandles, market, 
   const priorMomentum = priorStart > 0 ? (priorClose - priorStart) / priorStart : 0;
   const acceleration = recentMomentum - priorMomentum;
 
-  const recentVolume = average(recentWindow.map(candleVolume));
-  const priorVolume = average(priorWindow.map(candleVolume));
+  const recentVolumes = recentWindow.map(candleVolume);
+  const priorVolumes = priorWindow.map(candleVolume);
+  const recentVolume = average(recentVolumes);
+  const priorVolume = average(priorVolumes);
   const tickerVolume = safeNumber(ticker && (ticker.quoteVolume || ticker.baseVolume));
   const volumeDataOk = priorWindow.length >= 4 && recentWindow.length >= 3;
   const volumeRatio = !volumeDataOk
     ? 1
     : (priorVolume > 0 ? recentVolume / priorVolume : (recentVolume > 0 ? 1.05 : 1));
+  const volumeStd = stddev(recentVolumes);
+  const volumeConsistency = recentVolume > 0 ? clamp(1 - (volumeStd / recentVolume), 0, 1) : 0;
+  const lastCandleVolume = candleVolume(usableCandles[usableCandles.length - 1]);
+  const lastVolumeSpike = recentVolume > 0 ? lastCandleVolume / recentVolume : 0;
 
   const closes = usableCandles.map(candleClose).filter((value) => value > 0);
   const returns = closes.slice(1).map((close, index) => {
@@ -240,6 +246,17 @@ function analyzeMarket({ symbol, ticker, candles, highTimeframeCandles, market, 
     && momentumPersistenceScore < config.risk.minMomentumPersistence;
   const breakout = breakoutStats(usableCandles, config);
   const abnormalPump = Math.max(priceChange, recentMomentum, dailyChange) * 100 >= config.scanner.abnormalPumpPercent;
+  const manipulativeSpikeRisk = (lastVolumeSpike >= 2.8 && (oneCandlePump || abnormalPump || breakout.fakeBreakoutRisk)) ? 1 : 0;
+  const sustainedExpansion = clamp((volumeRatio - 1) / 1.2, 0, 1);
+  const volumeConfidence = clamp(
+    (volumeDataOk ? 0.25 : 0)
+      + sustainedExpansion * 0.45
+      + volumeConsistency * 0.25
+      + clamp(Math.log10(Math.max(1, tickerVolume)) / 9, 0, 1) * 0.15
+      - manipulativeSpikeRisk * 0.35,
+    0,
+    1
+  );
   const spreadPenalty = spread === null ? 0 : clamp(spread / Math.max(config.scanner.maxSpread, 0.0001), 0, 1);
 
   const volatilityScore = clamp(
@@ -291,6 +308,9 @@ function analyzeMarket({ symbol, ticker, candles, highTimeframeCandles, market, 
     acceleration,
     volumeRatio,
     volumeDataOk,
+    volumeConsistency,
+    volumeConfidence,
+    lastVolumeSpike,
     volatility,
     rollingStddev,
     atr: atrValue,

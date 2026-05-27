@@ -139,6 +139,27 @@ class ExchangeService {
     });
   }
 
+  async searchSpotMarkets(query, limit = 12) {
+    const term = String(query || '').trim().toUpperCase().replace(/[^A-Z0-9/]/g, '');
+    if (!term) return [];
+    const markets = await this.getSpotUsdtMarkets();
+    return markets
+      .filter((market) => {
+        const symbol = String(market.symbol || '').toUpperCase();
+        const base = String(market.base || '').toUpperCase();
+        const compact = symbol.replace('/', '');
+        return base.includes(term) || symbol.includes(term) || compact.includes(term);
+      })
+      .sort((a, b) => {
+        const aBase = String(a.base || '').toUpperCase();
+        const bBase = String(b.base || '').toUpperCase();
+        const aExact = aBase === term ? 0 : aBase.startsWith(term) ? 1 : 2;
+        const bExact = bBase === term ? 0 : bBase.startsWith(term) ? 1 : 2;
+        return aExact - bExact || a.symbol.localeCompare(b.symbol);
+      })
+      .slice(0, limit);
+  }
+
   getSpread(ticker) {
     const bid = Number(ticker && ticker.bid);
     const ask = Number(ticker && ticker.ask);

@@ -1,7 +1,8 @@
 'use strict';
 
-const { money, percent, round } = require('../utils/format');
+const { clamp, money, percent, round } = require('../utils/format');
 const { getStrategyRisk, regimeMultiplier } = require('../strategies/strategyConfig');
+const { getStrategyBudget } = require('../strategies/registry');
 
 class PortfolioService {
   constructor({ storage, cache, config, logger }) {
@@ -70,7 +71,7 @@ class PortfolioService {
     }
 
     const base = portfolio || {
-      cash: strategyKey ? (this.config.risk.paperStartBalance / 4) : this.config.risk.paperStartBalance,
+      cash: strategyKey && strategyKey !== 'legacy' ? this.getDefaultBudget(strategyKey) : this.config.risk.paperStartBalance,
       realizedPnl: 0,
       baseSymbol: this.config.exchange.baseSymbol
     };
@@ -121,6 +122,13 @@ class PortfolioService {
     return 'other';
   }
 
+  getDefaultBudget(strategyKey) {
+    if (strategyKey === 'degensniper' && Number(this.config.degenSniper.budget) > 0) {
+      return Number(this.config.degenSniper.budget);
+    }
+    return getStrategyBudget(strategyKey, this.config.risk.paperStartBalance);
+  }
+
   calculateAllocation({ strategyKey, cash, equity, metrics, confidence, marketRegime }) {
     const strategyRisk = getStrategyRisk(strategyKey, this.config.risk);
     const maxFraction = strategyRisk.maxTradeFraction || this.config.risk.maxTradeFraction;
@@ -136,7 +144,18 @@ class PortfolioService {
     return Math.min(cash, Math.max(this.config.risk.minTradeNotional, equity * fraction));
   }
 
-  async openPosition({ strategyKey, symbol, metrics, sentiment, confidence, reason, marketRegime }) {
+  async openPosition({
+    strategyKey,
+    symbol,
+    metrics,
+    sentiment,
+    confidence,
+    reason,
+    marketRegime,
+    notionalOverride,
+    source = 'strategy',
+    userId = null
+  }) {
     const lockKey = `open:${strategyKey || 'legacy'}:${symbol}`;
     return this.withLocalLock(lockKey, async () => {
       const result = await this.storage.db.runTransaction(async (transaction) => {
@@ -149,9 +168,9 @@ class PortfolioService {
         ]);
 
         const portfolio = portfolioSnap.exists ? portfolioSnap.data() : {
-          cash: strategyKey ? (this.config.risk.paperStartBalance / 4) : this.config.risk.paperStartBalance,
+          cash: strategyKey && strategyKey !== 'legacy' ? this.getDefaultBudget(strategyKey) : this.config.risk.paperStartBalance,
           realizedPnl: 0,
-          equity: strategyKey ? (this.config.risk.paperStartBalance / 4) : this.config.risk.paperStartBalance,
+          equity: strategyKey && strategyKey !== 'legacy' ? this.getDefaultBudget(strategyKey) : this.config.risk.paperStartBalance,
           baseSymbol: this.config.exchange.baseSymbol
         };
 
@@ -169,14 +188,17 @@ class PortfolioService {
 
         const cash = Number(portfolio.cash || 0);
         const equity = Number(portfolio.equity || portfolio.cash || this.config.risk.paperStartBalance);
-        const notional = this.calculateAllocation({
-          strategyKey,
-          cash,
-          equity,
-          metrics,
-          confidence,
-          marketRegime
-        });
+        const requestedNotional = Number(notionalOverride);
+        const notional = Number.isFinite(requestedNotional) && requestedNotional > 0
+          ? Math.min(cash, requestedNotional)
+          : this.calculateAllocation({
+            strategyKey,
+            cash,
+            equity,
+            metrics,
+            confidence,
+            marketRegime
+          });
         if (notional < this.config.risk.minTradeNotional) {
           return { executed: false, reason: 'insufficient paper cash' };
         }
@@ -188,6 +210,7 @@ class PortfolioService {
         const quantity = (notional - fee) / price;
         const now = new Date();
         const category = this.getCategory(symbol, metrics);
+        // TP/SL are dynamic and strategy-specific; stored fields are informational only.
         const position = {
           symbol,
           strategyKey: strategyKey || 'legacy',
@@ -197,14 +220,16 @@ class PortfolioService {
           entryPrice: price,
           notional,
           entryFee: fee,
-          stopLossPrice: price * (1 + this.config.risk.stopLoss),
-          takeProfitPrice: price * (1 + this.config.risk.takeProfit),
+          stopLossPrice: null,
+          takeProfitPrice: null,
           trailingStopPrice: null,
           highestPrice: price,
           confidence,
           sentiment: sentiment ? sentiment.label : 'neutral',
           reason,
           strategy: strategyKey || 'momentum-volume-volatility-confirmed',
+          source,
+          openedBy: userId,
           marketRegime: marketRegime ? marketRegime.regime : 'unknown',
           metrics,
           openedAt: now,
@@ -231,6 +256,11 @@ class PortfolioService {
           reason,
           sentiment: sentiment ? sentiment.label : 'neutral',
           strategyKey: strategyKey || 'legacy',
+          strategy: strategyKey || 'legacy',
+          source,
+          amount: notional,
+          userId,
+          timestamp: now,
           executedAt: now
         });
 
@@ -264,7 +294,132 @@ class PortfolioService {
     });
   }
 
-  async closePosition({ strategyKey, symbol, price, metrics, sentiment, reason }) {
+  async reducePosition({
+    strategyKey,
+    symbol,
+    fraction = 0.5,
+    price,
+    metrics,
+    sentiment,
+    reason,
+    source = 'strategy',
+    userId = null
+  }) {
+    const lockKey = `reduce:${strategyKey || 'legacy'}:${symbol}`;
+    return this.withLocalLock(lockKey, async () => {
+      const result = await this.storage.db.runTransaction(async (transaction) => {
+        const portfolioRef = this.storage.portfolioRef(strategyKey);
+        const positionRef = this.storage.positionRef(symbol, strategyKey);
+        const [portfolioSnap, positionSnap] = await Promise.all([
+          transaction.get(portfolioRef),
+          transaction.get(positionRef)
+        ]);
+
+        if (!positionSnap.exists || positionSnap.data().status !== 'open') {
+          return { executed: false, reason: 'position already closed' };
+        }
+
+        const portfolio = portfolioSnap.exists ? portfolioSnap.data() : {
+          cash: strategyKey && strategyKey !== 'legacy' ? this.getDefaultBudget(strategyKey) : this.config.risk.paperStartBalance,
+          realizedPnl: 0,
+          equity: strategyKey && strategyKey !== 'legacy' ? this.getDefaultBudget(strategyKey) : this.config.risk.paperStartBalance,
+          baseSymbol: this.config.exchange.baseSymbol
+        };
+        const position = positionSnap.data();
+        const exitPrice = Number(price || (metrics && metrics.price));
+        if (!exitPrice || exitPrice <= 0) return { executed: false, reason: 'invalid exit price' };
+
+        const sellFraction = clamp(fraction, 0.05, 0.95);
+        const quantity = Number(position.quantity || 0) * sellFraction;
+        const notionalBasis = Number(position.notional || 0) * sellFraction;
+        if (quantity <= 0 || notionalBasis <= 0) {
+          return { executed: false, reason: 'invalid partial size' };
+        }
+
+        const gross = quantity * exitPrice;
+        const fee = gross * this.config.risk.paperFeeRate;
+        const proceeds = gross - fee;
+        const pnl = proceeds - notionalBasis;
+        const pnlPct = notionalBasis > 0 ? pnl / notionalBasis : 0;
+        const now = new Date();
+
+        const remainingQuantity = Math.max(0, Number(position.quantity || 0) - quantity);
+        const remainingNotional = Math.max(0, Number(position.notional || 0) - notionalBasis);
+        const remainingEntryFee = Math.max(0, Number(position.entryFee || 0) - (Number(position.entryFee || 0) * sellFraction));
+
+        transaction.set(positionRef, {
+          ...position,
+          quantity: remainingQuantity,
+          notional: remainingNotional,
+          entryFee: remainingEntryFee,
+          partialProfitTaken: true,
+          partialExitCount: Number(position.partialExitCount || 0) + 1,
+          partialRealizedPnl: Number(position.partialRealizedPnl || 0) + pnl,
+          lastPartialExitPrice: exitPrice,
+          lastPartialExitAt: now,
+          updatedAt: now
+        }, { merge: false });
+
+        transaction.set(portfolioRef, {
+          ...portfolio,
+          cash: Number(portfolio.cash || 0) + proceeds,
+          realizedPnl: Number(portfolio.realizedPnl || 0) + pnl,
+          updatedAt: now
+        }, { merge: true });
+
+        const tradeRef = this.storage.tradesCollection().doc();
+        transaction.set(tradeRef, {
+          symbol,
+          side: 'SELL',
+          paper: true,
+          partial: true,
+          price: exitPrice,
+          quantity,
+          notional: gross,
+          fee,
+          pnl,
+          pnlPct,
+          reason,
+          sentiment: sentiment ? sentiment.label : 'neutral',
+          strategyKey: strategyKey || 'legacy',
+          strategy: strategyKey || 'legacy',
+          source,
+          userId,
+          timestamp: now,
+          executedAt: now
+        });
+
+        return {
+          executed: true,
+          position: {
+            ...position,
+            quantity: remainingQuantity,
+            notional: remainingNotional,
+            closedQuantity: quantity,
+            closedNotional: gross,
+            realizedPnl: pnl,
+            realizedPnlPct: pnlPct
+          },
+          tradeId: tradeRef.id
+        };
+      });
+
+      if (result.executed) {
+        this.logger.trade('Reduced paper position', {
+          strategyKey: strategyKey || 'legacy',
+          symbol,
+          price,
+          reason,
+          pnl: result.position.realizedPnl,
+          pnlPct: result.position.realizedPnlPct
+        });
+      }
+
+      return result;
+    });
+  }
+
+  async closePosition({ strategyKey, symbol, price, metrics, sentiment, reason, source = 'strategy', userId = null }) {
     const lockKey = `close:${strategyKey || 'legacy'}:${symbol}`;
     return this.withLocalLock(lockKey, async () => {
       const result = await this.storage.db.runTransaction(async (transaction) => {
@@ -280,9 +435,9 @@ class PortfolioService {
         }
 
         const portfolio = portfolioSnap.exists ? portfolioSnap.data() : {
-          cash: strategyKey ? (this.config.risk.paperStartBalance / 4) : this.config.risk.paperStartBalance,
+          cash: strategyKey && strategyKey !== 'legacy' ? this.getDefaultBudget(strategyKey) : this.config.risk.paperStartBalance,
           realizedPnl: 0,
-          equity: strategyKey ? (this.config.risk.paperStartBalance / 4) : this.config.risk.paperStartBalance,
+          equity: strategyKey && strategyKey !== 'legacy' ? this.getDefaultBudget(strategyKey) : this.config.risk.paperStartBalance,
           baseSymbol: this.config.exchange.baseSymbol
         };
         const position = positionSnap.data();
@@ -331,6 +486,10 @@ class PortfolioService {
           reason,
           sentiment: sentiment ? sentiment.label : 'neutral',
           strategyKey: strategyKey || 'legacy',
+          strategy: strategyKey || 'legacy',
+          source,
+          userId,
+          timestamp: now,
           executedAt: now
         });
 

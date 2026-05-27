@@ -1,6 +1,6 @@
 # NyroTrade
 
-NyroTrade is a production-oriented Node.js Telegram bot for crypto market monitoring and paper trading. It watches Binance spot USDT markets, discovers volatile/meme-style assets, scores momentum and volume spikes, checks news sentiment, and manages a virtual Firestore-backed portfolio.
+NyroTrade is a production-oriented Node.js Telegram bot for crypto market monitoring and paper trading. It watches Binance spot USDT markets, discovers volatile/meme-style assets, scores momentum and volume spikes, checks news sentiment, and manages a virtual Firestore-backed portfolio across five strategy agents.
 
 NyroTrade is paper trading only. It never submits real exchange trades.
 
@@ -10,7 +10,11 @@ NyroTrade is paper trading only. It never submits real exchange trades.
 - Binance spot market data through `ccxt`
 - Firestore persistence for settings, portfolio, positions, trades, alerts, watchlists, cooldowns, rankings, sentiment history, and last prices
 - Volatile scanner for high momentum, unusual volume, volatility score, liquidity, spread, market age, blacklist, and optional market cap filtering
-- Paper strategy engine with stop loss, take profit, momentum reversal, bearish sentiment, and volatility rank collapse exits
+- Paper strategy engine for WaveHunter, MomentumPulse, WhaleShadow, SentinelMind, and DegenSniper
+- DegenSniper high-risk opportunity scoring for acceleration, volume expansion, liquidity, narrative strength, whale activity, social velocity, volatility expansion, and continuation probability
+- WhaleShadow whale credibility scoring with wallet/cluster profitability proxies, repeated success/failure tracking, exchange-wallet filtering, market-maker filtering, accumulation/distribution scoring, and copy-worthy wallet score
+- Telegram `/control` panel with reports, stats, strategy pages, budgets, risk mode, manual paper buys, force paper sells, pause, and resume
+- Paper exits with adaptive stops, intelligent trailing exits, momentum decay, bearish sentiment, volume collapse, partial DegenSniper profit taking, and volatility rank collapse handling
 - Central in-memory market cache with cleanup and shared ticker/OHLCV access
 - Retry helper with timeout, backoff, and graceful network failure handling
 - Structured logs with `INFO`, `WARN`, `ERROR`, `TRADE`, `SIGNAL`, and `SYSTEM`
@@ -23,9 +27,24 @@ NyroTrade is paper trading only. It never submits real exchange trades.
 
 ## Commands
 
-`/start`, `/status`, `/report`, `/stats`, `/watchlist`, `/scanvolatile`, `/topvolatile`, `/trades`, `/portfolio`, `/positions`, `/resetpaper`, `/pause`, `/resume`, `/health`
+`/start`, `/control`, `/status`, `/report`, `/stats`, `/strategies`, `/watchlist`, `/scanvolatile`, `/topvolatile`, `/trades`, `/portfolio`, `/positions`, `/resetpaper`, `/pause`, `/resume`, `/health`
 
 Use `/resetpaper confirm` to reset the virtual portfolio and paper trade history.
+
+`/control` opens an inline control panel:
+
+- Report
+- Stats
+- Strategies
+- Budgets
+- Risk Mode
+- Search Coin
+- Force Buy
+- Force Sell
+- Pause
+- Resume
+
+The Strategies menu includes WaveHunter, MomentumPulse, WhaleShadow, SentinelMind, and DegenSniper. Each strategy page shows enabled status, budget, cash, equity, open positions, realized PnL, win rate, profit factor, and aggressiveness, with buttons to enable/disable, set budget, set aggressiveness, show trades, and reset the strategy.
 
 ## Requirements
 
@@ -84,6 +103,25 @@ REQUIRE_HIGHER_TIMEFRAME_TREND=true
 MAX_MEME_EXPOSURE_PCT=0.40
 TRAILING_STOP_PERCENT=0.035
 
+DEGEN_SNIPER_ENABLED=true
+DEGEN_SNIPER_BUDGET=20
+DEGEN_SNIPER_MAX_TRADE_FRACTION=0.25
+DEGEN_SNIPER_MIN_OPPORTUNITY_SCORE=0.78
+DEGEN_SNIPER_MAX_SPREAD=0.006
+DEGEN_SNIPER_MIN_VOLUME_ACCELERATION=2.0
+DEGEN_SNIPER_MIN_MOMENTUM_ACCELERATION=0.015
+DEGEN_SNIPER_PARTIAL_TAKE_PROFIT=true
+DEGEN_SNIPER_TRAILING_STOP=0.06
+
+MANUAL_TRADING_ENABLED=true
+MANUAL_TRADE_MAX_AMOUNT=20
+MANUAL_TRADE_CONFIRMATION_REQUIRED=true
+
+WHALE_CREDIBILITY_MIN_SCORE=0.70
+WHALE_TRACKING_ENABLED=true
+WHALE_EXCHANGE_WALLET_FILTER=true
+WHALE_MARKET_MAKER_FILTER=true
+
 SELF_PING=true
 SELF_PING_MINUTES=5
 ANALYTICS_REFRESH_MINUTES=15
@@ -94,6 +132,31 @@ AI_RANKING_ENABLED=false
 `WEBHOOK_URL` should be the public base URL only, for example `https://nyrotrade.onrender.com`. The app registers the Telegram endpoint at `/telegram/webhook`.
 
 `BINANCE_API_KEY` and `BINANCE_API_SECRET` are optional for public market data. NyroTrade does not need trading permissions.
+
+## Paper Allocation
+
+Total paper balance is 100 USDT. Strategy allocation is split evenly:
+
+- WaveHunter: 20 USDT
+- MomentumPulse: 20 USDT
+- WhaleShadow: 20 USDT
+- SentinelMind: 20 USDT
+- DegenSniper: 20 USDT
+
+Existing Firestore collections are preserved. On bootstrap, NyroTrade ensures a `strategyPortfolios/degensniper` document and keeps strategy budget metadata aligned with the five-way allocation.
+
+## Manual Paper Trading
+
+Manual trading from `/control` is paper-only:
+
+1. Click Search Coin or Force Buy.
+2. Type a symbol such as `DOGE`.
+3. Select a matching Binance USDT spot pair.
+4. Select the strategy that should execute the paper buy.
+5. Select `5 USDT`, `10 USDT`, `25%`, `50%`, or `Custom`.
+6. Confirm the action.
+
+Confirmed manual buys create Firestore trade records with `source: manual`, `strategy`, `symbol`, `amount`, `userId`, and `timestamp`. Force Sell lists open paper positions, asks for confirmation, and closes the selected paper position only.
 
 For `FIREBASE_PRIVATE_KEY`, keep the escaped newline form in hosted env vars:
 
@@ -124,8 +187,10 @@ New documents/collections are created automatically:
 - `analytics/performance` and `analyticsHistory/*`
 - `strategyDiagnostics/current`
 - `marketRegime/current`
+- `strategyPortfolios/degensniper`
+- `strategySettings/degensniper`
 
-No manual migration is required. Add the new env vars only if you want to override the defaults.
+No manual migration is required. Copy the new env vars from `.env.example` into your deployed environment.
 
 ## Strategy Improvements
 
@@ -134,6 +199,10 @@ NyroTrade now waits for stronger confirmation before paper entries: multiple bul
 Volatility scoring now blends ATR percentage, rolling standard deviation, candle range, daily movement, volume expansion, and spread penalty. Exits use confirmation candles, volatility-aware trailing stops, momentum decay, and less-sensitive stop-loss behavior to reduce premature sells.
 
 Portfolio sizing is confidence-, volatility-, ATR-, and market-regime-adjusted. Exposure controls cap meme and category concentration. The `/stats` command and scheduled analytics snapshots track long-term paper performance, including drawdown, expectancy, win rate, profit factor, streaks, symbol quality, and strategy health.
+
+DegenSniper is the highest-risk strategy. It looks for asymmetric short-term opportunities with early momentum acceleration, abnormal volume expansion, acceptable liquidity/spread, whale or social confirmation when available, and no obvious rug/dying-asset pattern. It does not use a fixed take-profit target; exits use trailing logic, momentum decay, volume collapse, whale distribution, volatility collapse, partial profit taking, and emergency reversal handling.
+
+WhaleShadow now imitates only high-credibility whale-like behavior. Its score blends prior WhaleShadow paper outcomes for the symbol, repeated successful/failed entries, exchange-wallet-like flow detection, market-maker-like filtering, accumulation/distribution, wallet clustering, and a copy-worthy wallet score.
 
 AI sentiment/ranking support is prepared but disabled by default. If `AI_RANKING_ENABLED=true` and Ollama is configured, AI can assist filtering weak signals only. It never controls all trading decisions.
 
@@ -191,6 +260,6 @@ logs/              Runtime structured log files
 
 ## Safety Model
 
-NyroTrade only reads public spot market data and simulates trades inside Firestore. Portfolio cash, positions, and trade history are virtual records. Keep Binance keys read-only if you choose to provide them.
+NyroTrade only reads public spot market data and simulates trades inside Firestore. Portfolio cash, positions, and trade history are virtual records. The code does not call `createOrder` or any real Binance execution method. Keep Binance keys read-only if you choose to provide them.
 
 This software is informational and educational. Crypto markets are volatile, and paper results do not imply future performance.

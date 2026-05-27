@@ -104,7 +104,7 @@ async function start() {
   const portfolio = new PortfolioService({ storage, cache, config, logger });
   const alerts = new AlertService({ storage, config, logger });
   const marketRegime = new MarketRegimeService({ exchange, storage, config, logger });
-  const whaleIntel = new WhaleIntelService({ config, logger });
+  const whaleIntel = new WhaleIntelService({ config, logger, storage });
   const analytics = new AnalyticsService({ storage, portfolio, config, logger });
   const strategy = new TradingStrategy({
     analyzer,
@@ -129,7 +129,13 @@ async function start() {
     storage,
     strategy,
     analytics,
-    marketRegime
+    marketRegime,
+    exchange,
+    analyzer,
+    sentiment,
+    alerts,
+    risk,
+    whaleIntel
   };
   const telegram = new TelegramService({ config, services, logger });
   alerts.setTelegram(telegram);

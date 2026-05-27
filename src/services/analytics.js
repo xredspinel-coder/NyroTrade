@@ -1,6 +1,7 @@
 'use strict';
 
 const { clamp, money, percent, round, toMillis } = require('../utils/format');
+const { getStrategyBudget, getStrategyKeys } = require('../strategies/registry');
 
 function mean(values) {
   const filtered = values.filter((value) => Number.isFinite(value));
@@ -42,7 +43,7 @@ class AnalyticsService {
   }
 
   async computeAll() {
-    const strategyKeys = ['wavehunter', 'momentumpulse', 'whaleshadow', 'sentinelmind'];
+    const strategyKeys = getStrategyKeys();
     const [overall, byStrategy, regime] = await Promise.all([
       this.compute(),
       Promise.all(strategyKeys.map(async (strategyKey) => {
@@ -55,6 +56,7 @@ class AnalyticsService {
 
     const comparison = byStrategy.map((row) => ({
       strategyKey: row.strategyKey,
+      startBalance: row.startBalance,
       winRate: row.winRate,
       profitFactor: row.profitFactor,
       expectancy: row.expectancy,
@@ -98,7 +100,10 @@ class AnalyticsService {
     const sharpeLikeRatio = stddev(returns) > 0 ? mean(returns) / stddev(returns) : 0;
 
     const sortedSells = sells.slice().sort((a, b) => toMillis(a.executedAt) - toMillis(b.executedAt));
-    let equity = strategyKey ? (this.config.risk.paperStartBalance / 4) : this.config.risk.paperStartBalance;
+    const startBalance = strategyKey
+      ? Number(snapshot.startBalance || this.getStrategyStartBalance(strategyKey))
+      : this.config.risk.paperStartBalance;
+    let equity = startBalance;
     let peak = equity;
     let maxDrawdown = 0;
     for (const trade of sortedSells) {
@@ -150,6 +155,7 @@ class AnalyticsService {
       totalTrades: trades.length,
       totalBuys: buys.length,
       totalSells: sells.length,
+      startBalance,
       winRate,
       lossRate,
       averageProfit,
@@ -220,7 +226,7 @@ class AnalyticsService {
     const base = this.config.exchange.baseSymbol;
     const streak = analytics.currentStreak || { type: 'none', count: 0 };
     const startBalance = analytics.strategyKey && analytics.strategyKey !== 'legacy'
-      ? this.config.risk.paperStartBalance / 4
+      ? Number(analytics.startBalance || this.getStrategyStartBalance(analytics.strategyKey))
       : this.config.risk.paperStartBalance;
     const pnlPct = startBalance > 0 ? (Number(analytics.totalRealizedPnl || 0) / startBalance) : 0;
     const label = analytics.strategyKey && analytics.strategyKey !== 'legacy'
@@ -252,17 +258,20 @@ class AnalyticsService {
   formatStrategyComparison(analytics, baseSymbol) {
     const rows = (analytics && analytics.strategies) || [];
     if (!rows.length) return 'No strategy stats yet.';
-    const perStrategy = startBalance => (row) => {
-      const pnlPct = startBalance > 0 ? (Number(row.totalRealizedPnl || 0) / startBalance) : 0;
-      return `${row.strategyKey}: ${percent(pnlPct)} | win ${percent(row.winRate || 0)} | PF ${round(row.profitFactor || 0, 2)} | DD ${percent(row.maxDrawdown || 0)}`;
-    };
-    const start = this.config.risk.paperStartBalance / 4;
     return rows.map((row) => {
       const name = row.strategyKey;
       const pnl = money(row.totalRealizedPnl || 0, baseSymbol);
+      const start = Number(row.startBalance || this.getStrategyStartBalance(row.strategyKey));
       const pnlPct = start > 0 ? percent((Number(row.totalRealizedPnl || 0) / start)) : '0%';
       return `${name}: ${pnl} (${pnlPct}) | win ${percent(row.winRate || 0)} | PF ${round(row.profitFactor || 0, 2)} | DD ${percent(row.maxDrawdown || 0)}`;
     }).join('\n');
+  }
+
+  getStrategyStartBalance(strategyKey) {
+    if (strategyKey === 'degensniper' && Number(this.config.degenSniper.budget) > 0) {
+      return Number(this.config.degenSniper.budget);
+    }
+    return getStrategyBudget(strategyKey, this.config.risk.paperStartBalance);
   }
 }
 

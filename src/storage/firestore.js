@@ -2,6 +2,9 @@
 
 const { FieldValue } = require('../firebase');
 const { sanitizeId, toMillis, uniqueSymbols } = require('../utils/format');
+const { STRATEGIES, getStrategyBudget, getStrategyKeys } = require('../strategies/registry');
+
+const ALLOCATION_VERSION = 'five-strategy-20-usdt-v1';
 
 function nowDate() {
   return new Date();
@@ -155,9 +158,8 @@ class FirestoreStorage {
   }
 
   async ensureStrategyBootstrap(now = nowDate()) {
-    const strategyKeys = ['wavehunter', 'momentumpulse', 'whaleshadow', 'sentinelmind'];
-    const startBalance = Number(this.config.risk.paperStartBalance || 100);
-    const perStrategy = startBalance / strategyKeys.length;
+    const strategyKeys = getStrategyKeys();
+    const startBalance = Number(this.config.risk.paperStartBalance);
 
     const refs = strategyKeys.flatMap((key) => [this.portfolioRef(key), this.strategySettingsRef(key)]);
     const snaps = await Promise.all(refs.map((ref) => ref.get()));
@@ -166,32 +168,70 @@ class FirestoreStorage {
       const key = strategyKeys[i];
       const portfolioSnap = snaps[i * 2];
       const settingsSnap = snaps[i * 2 + 1];
+      const configuredBudget = this.getConfiguredStrategyBudget(key, startBalance);
+      const savedBudget = settingsSnap.exists ? Number((settingsSnap.data() || {}).budget) : 0;
+      const budget = savedBudget > 0 ? savedBudget : configuredBudget;
 
       if (!portfolioSnap.exists) {
         batch.set(this.portfolioRef(key), {
           strategyKey: key,
-          cash: perStrategy,
-          startBalance: perStrategy,
+          cash: budget,
+          startBalance: budget,
+          allocationBudget: budget,
+          allocationVersion: ALLOCATION_VERSION,
           baseSymbol: this.config.exchange.baseSymbol,
           realizedPnl: 0,
-          equity: perStrategy,
+          equity: budget,
           createdAt: now,
           updatedAt: now
         });
+      } else {
+        const current = portfolioSnap.data() || {};
+        const patch = {
+          strategyKey: key,
+          startBalance: budget,
+          allocationBudget: budget,
+          allocationVersion: ALLOCATION_VERSION,
+          baseSymbol: this.config.exchange.baseSymbol,
+          updatedAt: now
+        };
+        const hasOpenValue = Number(current.positionValue || 0) > 0;
+        const cashOnly = !hasOpenValue
+          && Math.abs(Number(current.cash || 0) - Number(current.equity || current.cash || 0)) < 0.000001;
+        if (cashOnly && current.allocationVersion !== ALLOCATION_VERSION) {
+          const realizedPnl = Number(current.realizedPnl || 0);
+          patch.cash = Math.max(0, budget + realizedPnl);
+          patch.equity = patch.cash;
+        }
+        batch.set(this.portfolioRef(key), patch, { merge: true });
       }
 
       if (!settingsSnap.exists) {
         batch.set(this.strategySettingsRef(key), {
           strategyKey: key,
           paused: false,
-          aggressiveness: 0.55,
-          maxOpenPositions: Math.max(1, Math.floor(Number(this.config.risk.maxOpenPositions || 4) / 2)),
+          budget,
+          aggressiveness: key === 'degensniper' ? 0.9 : 0.55,
+          maxOpenPositions: Math.max(1, Math.floor(Number(this.config.risk.maxOpenPositions) / 2)),
           createdAt: now,
           updatedAt: now
         });
+      } else {
+        batch.set(this.strategySettingsRef(key), {
+          strategyKey: key,
+          budget,
+          updatedAt: now
+        }, { merge: true });
       }
     }
     await batch.commit();
+  }
+
+  getConfiguredStrategyBudget(strategyKey, startBalance = Number(this.config.risk.paperStartBalance)) {
+    if (strategyKey === 'degensniper' && Number(this.config.degenSniper.budget) > 0) {
+      return Number(this.config.degenSniper.budget);
+    }
+    return getStrategyBudget(strategyKey, startBalance);
   }
 
   async checkConnection() {
@@ -206,6 +246,62 @@ class FirestoreStorage {
   async getSettings() {
     const snap = await this.settingsRef().get();
     return snap.exists ? snap.data() : { paused: false };
+  }
+
+  async getStrategySettings(strategyKey) {
+    const snap = await this.strategySettingsRef(strategyKey).get();
+    return snap.exists ? snap.data() : { strategyKey, paused: false };
+  }
+
+  async updateStrategySettings(strategyKey, patch) {
+    await this.strategySettingsRef(strategyKey).set({
+      strategyKey,
+      ...patch,
+      updatedAt: nowDate()
+    }, { merge: true });
+    return this.getStrategySettings(strategyKey);
+  }
+
+  async setStrategyBudget(strategyKey, budget) {
+    const value = Number(budget);
+    if (!Number.isFinite(value) || value <= 0) {
+      throw new Error('Strategy budget must be a positive number');
+    }
+
+    await this.db.runTransaction(async (transaction) => {
+      const portfolioRef = this.portfolioRef(strategyKey);
+      const settingsRef = this.strategySettingsRef(strategyKey);
+      const [portfolioSnap, settingsSnap] = await Promise.all([
+        transaction.get(portfolioRef),
+        transaction.get(settingsRef)
+      ]);
+      const portfolio = portfolioSnap.exists ? portfolioSnap.data() : {};
+      const oldBudget = Number(portfolio.startBalance || portfolio.allocationBudget || 0);
+      const delta = oldBudget > 0 ? value - oldBudget : value;
+      const cash = Math.max(0, oldBudget > 0 ? Number(portfolio.cash || 0) + delta : value);
+      const equity = Math.max(0, oldBudget > 0 ? Number(portfolio.equity || portfolio.cash || 0) + delta : value);
+      const now = nowDate();
+
+      transaction.set(portfolioRef, {
+        ...portfolio,
+        strategyKey,
+        startBalance: value,
+        allocationBudget: value,
+        cash,
+        equity,
+        baseSymbol: this.config.exchange.baseSymbol,
+        updatedAt: now
+      }, { merge: true });
+
+      transaction.set(settingsRef, {
+        ...(settingsSnap.exists ? settingsSnap.data() : {}),
+        strategyKey,
+        budget: value,
+        updatedAt: now
+      }, { merge: true });
+    });
+
+    return this.getPortfolio(strategyKey);
   }
 
   async updateSettings(patch) {
@@ -572,15 +668,74 @@ class FirestoreStorage {
     await this.deleteCollection(this.positionsCollection(), 250);
     await this.deleteCollection(this.tradesCollection(), 250);
     await this.analyticsRef().delete().catch(() => undefined);
+    const now = nowDate();
     await this.portfolioRef().set({
       cash: this.config.risk.paperStartBalance,
       startBalance: this.config.risk.paperStartBalance,
       baseSymbol: this.config.exchange.baseSymbol,
       realizedPnl: 0,
       equity: this.config.risk.paperStartBalance,
-      resetAt: nowDate(),
-      updatedAt: nowDate()
+      resetAt: now,
+      updatedAt: now
     }, { merge: false });
+
+    const batch = this.db.batch();
+    for (const strategy of STRATEGIES) {
+      const budget = this.getConfiguredStrategyBudget(strategy.key);
+      batch.set(this.portfolioRef(strategy.key), {
+        strategyKey: strategy.key,
+        cash: budget,
+        startBalance: budget,
+        allocationBudget: budget,
+        allocationVersion: ALLOCATION_VERSION,
+        baseSymbol: this.config.exchange.baseSymbol,
+        realizedPnl: 0,
+        equity: budget,
+        resetAt: now,
+        updatedAt: now
+      }, { merge: false });
+      batch.set(this.strategySettingsRef(strategy.key), {
+        strategyKey: strategy.key,
+        budget,
+        paused: false,
+        updatedAt: now
+      }, { merge: true });
+      batch.delete(this.strategyAnalyticsRef(strategy.key));
+    }
+    await batch.commit();
+  }
+
+  async resetStrategyPaper(strategyKey) {
+    const key = String(strategyKey || '');
+    if (!getStrategyKeys().includes(key)) {
+      throw new Error(`Unknown strategy: ${strategyKey}`);
+    }
+    const settings = await this.getStrategySettings(key).catch(() => null);
+    const savedBudget = settings ? Number(settings.budget) : 0;
+    const budget = savedBudget > 0 ? savedBudget : this.getConfiguredStrategyBudget(key);
+    const now = nowDate();
+    await this.deleteWhere(this.positionsCollection(), 'strategyKey', '==', key);
+    await this.deleteWhere(this.tradesCollection(), 'strategyKey', '==', key);
+    await this.strategyAnalyticsRef(key).delete().catch(() => undefined);
+    await this.portfolioRef(key).set({
+      strategyKey: key,
+      cash: budget,
+      startBalance: budget,
+      allocationBudget: budget,
+      allocationVersion: ALLOCATION_VERSION,
+      baseSymbol: this.config.exchange.baseSymbol,
+      realizedPnl: 0,
+      equity: budget,
+      resetAt: now,
+      updatedAt: now
+    }, { merge: false });
+    await this.strategySettingsRef(key).set({
+      strategyKey: key,
+      budget,
+      paused: false,
+      updatedAt: now
+    }, { merge: true });
+    return this.getPortfolio(key);
   }
 
   async cleanupStaleData() {

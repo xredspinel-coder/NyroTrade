@@ -10,6 +10,19 @@ function isStaleMetrics(metrics, maxAgeMinutes) {
   return Date.now() - analyzedMs > maxAgeMinutes * 60 * 1000;
 }
 
+function freshnessScore(metrics, maxAgeMinutes) {
+  if (!metrics || !metrics.analyzedAt) return 0;
+  const analyzedMs = Date.parse(metrics.analyzedAt);
+  if (!Number.isFinite(analyzedMs)) return 0;
+  const ageMs = Math.max(0, Date.now() - analyzedMs);
+  const maxMs = Math.max(1, maxAgeMinutes) * 60 * 1000;
+  // 1.0 at fresh, decays smoothly; never hard-zero unless extremely old/missing.
+  const ratio = ageMs / maxMs;
+  if (ratio <= 0) return 1;
+  if (ratio >= 3) return 0.05;
+  return clamp(1 - (ratio ** 1.25) * 0.85, 0.05, 1);
+}
+
 function effectiveAtrPercent(metrics, floor = 0.0015) {
   const raw = Number(metrics && metrics.atrPercent);
   if (!Number.isFinite(raw) || raw <= 0) return floor;
@@ -58,16 +71,25 @@ class RiskService {
     if (!metrics || !metrics.price) reasons.push('missing market metrics');
     if (metrics && metrics.quoteVolume < this.config.scanner.minQuoteVolumeUsdt) reasons.push('liquidity below minimum');
     if (metrics && metrics.liquidityScore < this.config.scanner.minLiquidityScore) reasons.push('liquidity score below minimum');
-    if (metrics && metrics.spread !== null && metrics.spread > this.config.scanner.maxSpread) reasons.push('spread too wide');
-    if (metrics && isStaleMetrics(metrics, this.config.risk.staleSignalMaxAgeMinutes)) reasons.push('stale signal');
+    const maxSpread = Number(strategyRisk.maxSpread || this.config.scanner.maxSpread);
+    if (metrics && metrics.spread !== null && metrics.spread > maxSpread) reasons.push('spread too wide');
+    const maxAge = Number(strategyRisk.staleSignalMaxAgeMinutes || this.config.risk.staleSignalMaxAgeMinutes);
+    const fresh = freshnessScore(metrics, maxAge);
+    if (fresh <= 0.15) reasons.push('signal too stale');
 
     if (strategyKey === 'momentumpulse' || !strategyKey) {
       if (metrics && metrics.priceChange < this.config.risk.minBuyPriceChange) {
         reasons.push(`momentum too weak (${percent(metrics.priceChange, 3)})`);
       }
       if (metrics && metrics.recentMomentum <= 0) reasons.push('short-term momentum not positive');
-      if (metrics && metrics.volumeRatio < (strategyRisk.minVolumeRatio || this.config.risk.minVolumeRatio)) {
-        reasons.push('volume spike not confirmed');
+      const minVr = Number(strategyRisk.minVolumeRatio || this.config.risk.minVolumeRatio);
+      const vc = Number(metrics && metrics.volumeConfidence);
+      const volumeConfidence = Number.isFinite(vc) ? vc : clamp((Number(metrics.volumeRatio || 1) - 1) / Math.max(0.25, (minVr - 1)), 0, 1);
+      if (metrics && metrics.volumeDataOk === false && metrics.quoteVolume < this.config.scanner.minQuoteVolumeUsdt * 1.15) {
+        reasons.push('weak volume data quality');
+      }
+      if (metrics && (metrics.volumeRatio < minVr) && volumeConfidence < 0.45) {
+        reasons.push('volume confidence too weak');
       }
       if (metrics && metrics.volatilityScore < this.config.scanner.minVolatilityScore) reasons.push('volatility score too low');
       if (metrics && metrics.volatilityScore >= this.config.risk.maxExtremeVolatilityScore) reasons.push('extreme volatility safeguard');
@@ -133,7 +155,7 @@ class RiskService {
       if (extra && extra.length) reasons.push(...extra);
     }
 
-    const confidence = this.signalConfidence(metrics, sentiment, strategyKey, marketRegime);
+    const confidence = this.signalConfidence(metrics, sentiment, strategyKey, marketRegime) * fresh;
     return {
       allowed: reasons.length === 0,
       reasons,
@@ -164,20 +186,41 @@ class RiskService {
     const bearishConfirmed = metrics.bearishConfirmationCandles >= this.config.risk.exitConfirmationCandles;
     const stopLossBuffer = Math.min(0.025, atrPct * 0.5);
 
-    if (strategyKey !== 'wavehunter' && pnlPct <= this.config.risk.stopLoss - stopLossBuffer) {
-      return { shouldSell: true, reason: 'stop loss hit', pnlPct };
+    // Strategy-specific adaptive stop logic (replaces fixed STOP_LOSS trigger).
+    // No fixed TP sell: takeProfit is used only as a "profit mode" threshold for trailing behavior.
+    const baseStop = Number(this.config.risk.stopLoss);
+    const atrStop = strategyKey === 'momentumpulse'
+      ? -(atrPct * 2.2)
+      : strategyKey === 'whaleshadow'
+        ? -(atrPct * 2.8)
+        : strategyKey === 'sentinelmind'
+          ? -(atrPct * 2.6)
+          : -(atrPct * 3.2);
+    const dynamicStop = Math.min(baseStop, atrStop) - stopLossBuffer;
+
+    if (strategyKey === 'wavehunter') {
+      // WaveHunter: tolerate drawdown; exit only on danger-zone + structural weakness.
+      const danger = -(Math.max(0.18, atrPct * 6.0));
+      const structureWeak = !metrics.higherTimeframeTrendOk && metrics.recentMomentum < -0.002;
+      if (pnlPct <= danger && structureWeak && bearishConfirmed) {
+        return { shouldSell: true, reason: 'wave danger zone: structure weakness', pnlPct };
+      }
+    } else if (pnlPct <= dynamicStop) {
+      return { shouldSell: true, reason: 'adaptive stop hit', pnlPct };
     }
 
-    if (pnlPct >= this.config.risk.takeProfit) {
-      if (trailingStopPrice && metrics.price <= trailingStopPrice && heldLongEnough) {
-        return { shouldSell: true, reason: 'volatility-adjusted trailing take profit', pnlPct };
-      }
-      return {
-        shouldSell: false,
-        reason: 'take profit reached; trailing stop active',
-        pnlPct,
-        positionPatch: { highestPrice, trailingStopPrice }
-      };
+    // Profit management: no fixed take-profit sell.
+    // Trailing is active based on pnl threshold + weakening conditions.
+    const profitMode = pnlPct >= Number(this.config.risk.takeProfit) * 0.6;
+    const volumeCollapse = Number(metrics.volumeRatio || 1) < 0.9 && Number(metrics.volumeConfidence || 0.5) < 0.35;
+    const rejection = metrics.fakeBreakoutRisk || (metrics.upperWickRatio > 0.6 && metrics.breakoutConfirmed);
+    const momentumWeakening = Number(metrics.momentumDecay || 0) > 0.002 || (metrics.acceleration < 0 && metrics.recentMomentum < 0.001);
+
+    if (profitMode && trailingStopPrice && metrics.price <= trailingStopPrice && bearishConfirmed) {
+      return { shouldSell: true, reason: 'trailing exit confirmed', pnlPct };
+    }
+    if (profitMode && (volumeCollapse || rejection) && momentumWeakening && bearishConfirmed) {
+      return { shouldSell: true, reason: 'exhaustion + momentum weakening', pnlPct };
     }
 
     if (!heldLongEnough) {
@@ -215,7 +258,9 @@ class RiskService {
     const sentimentBoost = sentiment
       ? (sentiment.label === 'bullish' ? 0.1 : sentiment.label === 'neutral' ? 0.03 : -0.18)
       : 0;
-    const volumeComponent = clamp((metrics.volumeRatio - 1) / 2.5, 0, 1);
+    const volumeComponent = Number.isFinite(Number(metrics.volumeConfidence))
+      ? Number(metrics.volumeConfidence)
+      : clamp((metrics.volumeRatio - 1) / 2.5, 0, 1);
     const regime = regimeMultiplier(marketRegime, this.getStrategyConfig(strategyKey));
 
     const base = clamp(

@@ -4,6 +4,7 @@ const WaveHunterAgent = require('./agents/waveHunter');
 const MomentumPulseAgent = require('./agents/momentumPulse');
 const WhaleShadowAgent = require('./agents/whaleShadow');
 const SentinelMindAgent = require('./agents/sentinelMind');
+const DegenSniperAgent = require('./agents/degenSniper');
 
 class TradingStrategy {
   constructor(services) {
@@ -15,7 +16,8 @@ class TradingStrategy {
       new WaveHunterAgent(services),
       new MomentumPulseAgent(services),
       new WhaleShadowAgent(services),
-      new SentinelMindAgent(services)
+      new SentinelMindAgent(services),
+      new DegenSniperAgent(services)
     ];
   }
 

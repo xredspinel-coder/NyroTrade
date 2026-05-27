@@ -97,9 +97,13 @@ class WhaleShadowAgent {
         const metrics = await this.analyzer.analyzeSymbol(symbol);
         const symbolSentiment = await this.sentiment.getSentiment(symbol);
         const whale = await this.whaleIntel.getSignal(symbol, metrics);
-        const minScore = this.risk.getStrategyConfig(this.strategyKey).minWhaleScore || 0.62;
+        const strategyRisk = this.risk.getStrategyConfig(this.strategyKey);
+        const minScore = strategyRisk.whaleCredibilityMinScore || strategyRisk.minWhaleScore || 0.62;
 
         if (!whale.credible || whale.score < minScore) continue;
+        if (whale.credibility && whale.credibility.whaleDistribution > whale.credibility.whaleAccumulation) continue;
+        if (whale.credibility && whale.credibility.exchangeWalletDetection >= 0.7) continue;
+        if (whale.credibility && whale.credibility.marketMakerFiltering >= 0.7) continue;
         if (marketRegime && marketRegime.regime === 'low_liquidity') continue;
         if (metrics.memeScore >= 0.85) continue;
 
@@ -119,9 +123,11 @@ class WhaleShadowAgent {
         if (!decision.allowed) continue;
 
         const confidence = clamp(decision.confidence * 0.55 + whale.score * 0.45, 0, 1);
+        const credibility = whale.credibility || {};
         const reason = [
-          'whale flow proxy',
-          `whaleScore ${Math.round(whale.score * 100)}%`,
+          'high-credibility whale flow',
+          `copyScore ${Math.round((credibility.copyWorthyWalletScore || whale.score) * 100)}%`,
+          `accum ${Math.round((credibility.whaleAccumulation || 0) * 100)}%`,
           whale.reasons.join('; ') || whale.source,
           `vol ${metrics.volumeRatio ? metrics.volumeRatio.toFixed(2) : 'n/a'}x`,
           `regime ${marketRegime ? marketRegime.regime : 'unknown'}`,
@@ -169,4 +175,3 @@ class WhaleShadowAgent {
 }
 
 module.exports = WhaleShadowAgent;
-

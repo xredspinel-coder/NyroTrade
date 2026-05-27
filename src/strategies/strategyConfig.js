@@ -10,6 +10,7 @@ const DEFAULTS = {
     globalTradeCooldownMinutes: 8,
     symbolTradeCooldownMinutes: 30,
     minWaveScore: 0.55,
+    staleSignalMaxAgeMinutes: 15,
     aggressiveness: 0.5,
     useTraditionalStopLoss: false,
     minHoldMinutes: 60
@@ -20,7 +21,7 @@ const DEFAULTS = {
     buyCooldownMinutes: 25,
     globalTradeCooldownMinutes: 6,
     symbolTradeCooldownMinutes: 20,
-    minVolumeRatio: 1.15,
+    staleSignalMaxAgeMinutes: 5,
     requireBreakout: true,
     requireEmaTrend: true,
     requireHigherTimeframeTrend: true,
@@ -34,6 +35,7 @@ const DEFAULTS = {
     globalTradeCooldownMinutes: 7,
     symbolTradeCooldownMinutes: 25,
     minWhaleScore: 0.62,
+    staleSignalMaxAgeMinutes: 10,
     aggressiveness: 0.55,
     minHoldMinutes: 30
   },
@@ -45,8 +47,21 @@ const DEFAULTS = {
     symbolTradeCooldownMinutes: 25,
     minSentimentEdge: 0.62,
     minSentimentConfidence: 0.35,
+    staleSignalMaxAgeMinutes: 8,
     aggressiveness: 0.6,
     minHoldMinutes: 25
+  },
+  degensniper: {
+    maxOpenPositions: 1,
+    buyCooldownMinutes: 12,
+    globalTradeCooldownMinutes: 3,
+    symbolTradeCooldownMinutes: 8,
+    staleSignalMaxAgeMinutes: 2,
+    requireBreakout: false,
+    requireEmaTrend: false,
+    requireHigherTimeframeTrend: false,
+    aggressiveness: 0.9,
+    minHoldMinutes: 0
   }
 };
 
